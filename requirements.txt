@@ -1,0 +1,9 @@
+Flask
+gunicorn
+opencv-python
+numpy
+azure-cognitiveservices-vision-computervision
+msrest
+tenacity
+sdnotify
+gevent
