@@ -7,3 +7,4 @@ msrest
 tenacity
 sdnotify
 gevent
+influxdb-client

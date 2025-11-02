@@ -1,29 +1,28 @@
-# --- 1. Secret ---
-# Stores your sensitive credentials
 apiVersion: v1
 kind: Secret
 metadata:
-  name: rtsp-app-secret
-  namespace: default
+  name: rtsp-config
 type: Opaque
 stringData:
-  # !! IMPORTANT: Update these values with your real credentials
-  AZURE_VISION_KEY: "YOUR_AZURE_KEY_HERE"
-  AZURE_VISION_ENDPOINT: "YOUR_AZURE_ENDPOINT_HERE"
-  RTSP_URL: "rtsp://192.168.1.250/axis-media/media.amp"
+  # --- REQUIRED: Replace these with your actual Azure credentials ---
+  AZURE_VISION_SUBSCRIPTION_KEY: "YOUR_AZURE_KEY_HERE"
+  AZURE_VISION_ENDPOINT: "https://your-endpoint.cognitiveservices.azure.com/"
+  RTSP_URL: "rtsp://your-stream-url-here"
+  
+  # --- NEW: InfluxDB Connection Details (MUST MATCH k8s-influxdb.yaml) ---
+  INFLUXDB_URL: "http://influxdb-service:8086"
+  INFLUXDB_TOKEN: "YOUR_INFLUXDB_TOKEN" # !!! REPLACE THIS WITH YOUR SECURE TOKEN !!!
+  INFLUXDB_ORG: "rtsp-project-org"
+  INFLUXDB_BUCKET: "analysis_data"
 
 ---
-# --- 2. Deployment ---
-# Deploys a single Pod with two containers that share memory
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rtsp-object-detector
-  namespace: default
   labels:
     app: rtsp-object-detector
 spec:
-  # This application is stateful (due to shared memory) and cannot be scaled horizontally
   replicas: 1
   selector:
     matchLabels:
@@ -34,123 +33,72 @@ spec:
         app: rtsp-object-detector
     spec:
       volumes:
-        # Create a shared in-memory volume for the two containers
-        - name: frame-buffer
+        # Volume for inter-container communication (Shared Memory replacement)
+        - name: shm-volume
           emptyDir:
-            medium: Memory
-            # Set a size limit to prevent memory exhaustion
-            sizeLimit: "256Mi"
-
+            medium: Memory # Use RAM for speed
+            sizeLimit: 10Mi # Limit memory usage
       containers:
-        # --- Container 1: The Web Application (app.py) ---
+        # 1. Web Application Container
         - name: web-app
-          # !! IMPORTANT: Update this with your container registry and image name
-          image: "your-registry/rtsp-object-detector:latest"
-          imagePullPolicy: Always
+          image: your-registry/rtsp-object-detector:latest # !!! REPLACE WITH YOUR IMAGE PATH !!!
+          command: ["gunicorn", "-b", "0.0.0.0:8000", "-k", "gevent", "app:app"]
           ports:
             - containerPort: 8000
-              name: http
-          command: ["gunicorn"]
-          args: [
-            "--workers", "3",
-            "--worker-class", "gevent",
-            "--bind", "0.0.0.0:8000",
-            "app:app"
-          ]
-          env:
-            # Load credentials from the Secret
-            - name: AZURE_VISION_SUBSCRIPTION_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: rtsp-app-secret
-                  key: AZURE_VISION_KEY
-            - name: AZURE_VISION_ENDPOINT
-              valueFrom:
-                secretKeyRef:
-                  name: rtsp-app-secret
-                  key: AZURE_VISION_ENDPOINT
           volumeMounts:
-            # Mount the shared memory volume
-            - name: frame-buffer
-              mountPath: /dev/shm
-          readinessProbe:
-            httpGet:
-              path: /
-              port: 8000
-            initialDelaySeconds: 10
-            periodSeconds: 5
-          livenessProbe:
-            httpGet:
-              path: /
-              port: 8000
-            initialDelaySeconds: 15
-            periodSeconds: 10
+            - name: shm-volume
+              mountPath: /dev/shm # Mount the emptyDir as the shared memory location
+          envFrom:
+            - secretRef:
+                name: rtsp-config
+          resources:
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
 
-        # --- Container 2: The Camera Manager (camera_manager.py) ---
+        # 2. Camera Manager Container
         - name: camera-manager
-          # !! IMPORTANT: Use the *same image* as the web-app
-          image: "your-registry/rtsp-object-detector:latest"
-          imagePullPolicy: Always
-          command: ["python3"]
-          args: ["camera_manager.py"]
-          env:
-            # Load the RTSP URL from the Secret
-            - name: RTSP_STREAM_URL
-              valueFrom:
-                secretKeyRef:
-                  name: rtsp-app-secret
-                  key: RTSP_URL
-            # Set the camera source directly.
-            # The 'local' camera option is not viable in Kubernetes without
-            # privileged access, so we hardcode this to 'rtsp'.
-            - name: CAMERA_SOURCE
-              value: "rtsp"
+          image: your-registry/rtsp-object-detector:latest # !!! REPLACE WITH YOUR IMAGE PATH !!!
+          command: ["python3", "camera_manager.py"]
           volumeMounts:
-            # Mount the *same* shared memory volume
-            - name: frame-buffer
-              mountPath: /dev/shm
-
+            - name: shm-volume
+              mountPath: /dev/shm # Mount the emptyDir as the shared memory location
+          envFrom:
+            - secretRef:
+                name: rtsp-config
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
 ---
-# --- 3. Service ---
-# Exposes the web-app container internally in the cluster
 apiVersion: v1
 kind: Service
 metadata:
-  name: rtsp-object-detector-svc
-  namespace: default
+  name: rtsp-object-detector-service
 spec:
-  type: ClusterIP
   selector:
-    # This must match the Deployment's labels
     app: rtsp-object-detector
   ports:
-    - port: 80
-      # This must match the web-app containerPort
+    - protocol: TCP
+      port: 80
       targetPort: 8000
 
 ---
-# --- 4. Ingress ---
-# Exposes the Service to the outside world via your nginx-ingress-controller
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: rtsp-object-detector-ingress
-  namespace: default
+  name: rtsp-detector-ingress
   annotations:
-    # This assumes your RKE2 cluster's default IngressClass is 'nginx'
-    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
 spec:
   rules:
-    # !! IMPORTANT: Update this host to your desired domain
-    - host: "rtsp-detector.your-domain.com"
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                # This must match the Service name
-                name: rtsp-object-detector-svc
-                port:
-                  # This must match the Service port
-                  number: 80
+  - host: rtsp-detector.your-domain.com # !!! REPLACE THIS WITH YOUR HOSTNAME !!!
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rtsp-object-detector-service
+            port:
+              number: 80

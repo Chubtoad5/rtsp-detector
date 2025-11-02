@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: influxdb-pvc
+  labels:
+    app: influxdb
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi # Adjust size as needed
+  # RKE2 typically uses 'local-path' as the default storage class
+  storageClassName: local-path 
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: influxdb
+  labels:
+    app: influxdb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: influxdb
+  template:
+    metadata:
+      labels:
+        app: influxdb
+    spec:
+      volumes:
+        - name: influxdb-storage
+          persistentVolumeClaim:
+            claimName: influxdb-pvc
+      containers:
+        - name: influxdb
+          image: influxdb:2.7.5-alpine
+          ports:
+            - containerPort: 8086
+          env:
+            # Set up the initial InfluxDB configuration on first run
+            - name: DOCKER_INFLUXDB_INIT_MODE
+              value: setup
+            - name: DOCKER_INFLUXDB_INIT_USERNAME
+              value: rtsp-user
+            - name: DOCKER_INFLUXDB_INIT_PASSWORD
+              value: ChangeMeToASecret
+            - name: DOCKER_INFLUXDB_INIT_ORG
+              value: rtsp-project-org
+            - name: DOCKER_INFLUXDB_INIT_BUCKET
+              value: analysis_data
+            - name: DOCKER_INFLUXDB_INIT_ADMIN_TOKEN
+              value: "Yeahbuddy123!"
+          volumeMounts:
+            - mountPath: /var/lib/influxdb
+              name: influxdb-storage
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: influxdb-service
+  labels:
+    app: influxdb
+spec:
+  selector:
+    app: influxdb
+  ports:
+    - protocol: TCP
+      port: 8086
+      targetPort: 8086
