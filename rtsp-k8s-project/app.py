@@ -14,6 +14,7 @@ from msrest.authentication import CognitiveServicesCredentials
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 from datetime import datetime
+import datetime as dt # Added for timedelta
 
 # =============================================================================
 # CONFIGURATION
@@ -231,12 +232,12 @@ def get_analysis_history():
 
     try:
         # --- FIX for Schema Collision Error ---
-        # Query retrieves the last 50 raw points, sorted by time, within the last 30 days.
-        # This avoids the Flux aggregation that caused the 'int and string' type collision.
+        # 1. Filter out the integer field 'object_count' from the main query 
+        #    to guarantee only string values are returned in the _value column.
         query = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
           |> range(start: -30d) 
-          |> filter(fn: (r) => r._measurement == "analysis_record")
+          |> filter(fn: (r) => r._measurement == "analysis_record" and r._field != "object_count")
           |> sort(columns: ["_time"], desc: true)
           |> limit(n: 50) 
         '''
@@ -258,6 +259,24 @@ def get_analysis_history():
                 field_value = record.values['_value']
                 
                 time_to_data[ts][field_name] = field_value
+
+        # 2. Get the integer 'object_count' records separately
+        count_query = f'''
+        from(bucket: "{INFLUXDB_BUCKET}")
+          |> range(start: -30d) 
+          |> filter(fn: (r) => r._measurement == "analysis_record" and r._field == "object_count")
+          |> sort(columns: ["_time"], desc: true)
+          |> limit(n: 50) 
+        '''
+        count_tables = query_api.query(count_query, org=INFLUXDB_ORG)
+        
+        # Merge object_count back into time_to_data
+        for table in count_tables:
+            for record in table.records:
+                ts = record.values['_time'].isoformat()
+                if ts in time_to_data:
+                    time_to_data[ts]['object_count'] = record.values['_value']
+
 
         # Convert the aggregated dictionary values into a sorted list
         # Filter out incomplete records (those missing the frame or description)
@@ -287,7 +306,8 @@ def get_historical_frame(timestamp):
         
         # Define a narrow time window around the timestamp
         start_time = ts_dt.strftime('%Y-%m-%dT%H:%M:%S.%NZ')
-        end_time = (ts_dt + datetime.timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%S.%NZ')
+        # Use timedelta from the imported dt library
+        end_time = (ts_dt + dt.timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%S.%NZ')
         
         query = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
@@ -304,7 +324,12 @@ def get_historical_frame(timestamp):
             for record in table.records:
                 field_name = record.values['_field']
                 field_value = record.values['_value']
-                historical_record[field_name] = field_value
+                
+                # Explicitly cast integer fields back to int if needed
+                if field_name == 'object_count':
+                    historical_record[field_name] = int(field_value)
+                else:
+                    historical_record[field_name] = field_value
         
         if 'frame_b64' not in historical_record:
             return jsonify({'error': 'Historical record not found or incomplete.'}), 404
