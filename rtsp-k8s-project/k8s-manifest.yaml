@@ -8,8 +8,8 @@ metadata:
 type: Opaque
 stringData:
   # !! IMPORTANT: Update these values with your real credentials
-  AZURE_VISION_KEY: "3DRtt6PnyLRj8yk3CFuGPlYpEJLBnXIH9qznZkfTrYFuoDJO9PipJQQJ99BJACYeBjFXJ3w3AAAFACOGMPNH"
-  AZURE_VISION_ENDPOINT: "https://dapvision.cognitiveservices.azure.com/"
+  AZURE_VISION_KEY: "YOUR_AZURE_KEY_HERE"
+  AZURE_VISION_ENDPOINT: "YOUR_AZURE_ENDPOINT_HERE"
   RTSP_URL: "rtsp://192.168.1.250/axis-media/media.amp"
 
 ---
@@ -45,8 +45,8 @@ spec:
         # --- Container 1: The Web Application (app.py) ---
         - name: web-app
           # !! IMPORTANT: Update this with your container registry and image name
-          image: "artifacts.realmstead.com:8443/library/rtsp-object-detector:latest"
-          imagePullPolicy: IfNotPresent
+          image: "your-registry/rtsp-object-detector:latest"
+          imagePullPolicy: Always
           ports:
             - containerPort: 8000
               name: http
