@@ -8,6 +8,7 @@ stringData:
   AZURE_VISION_SUBSCRIPTION_KEY: "YOUR_AZURE_KEY_HERE"
   AZURE_VISION_ENDPOINT: "https://your-endpoint.cognitiveservices.azure.com/"
   RTSP_URL: "rtsp://your-stream-url-here"
+  CAMERA_SOURCE: "rtsp" 
   
   # --- NEW: InfluxDB Connection Details (MUST MATCH k8s-influxdb.yaml) ---
   INFLUXDB_URL: "http://influxdb-service:8086"
