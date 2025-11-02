@@ -41,7 +41,7 @@
         <h2>Analysis Results</h2>
         <p><strong>Description:</strong> <span id="descriptionText">No analysis yet.</span></p>
         <p><strong>Tags:</strong> <span id="tagsList">No analysis yet.</span></p>
-        <p><strong>All Detected Objects:</strong></p>
+        <p><strong>Objects Detected with Confidence:</strong></p>
         <ul id="objectsList"><li>No analysis yet.</li></ul>
     </div>
 
@@ -80,17 +80,17 @@
         });
 
         function populateAnalysisDetails(data) {
-             descriptionText.textContent = data.description?.captions?.[0]?.text || 'No description available.';
-             tagsList.textContent = data.tags?.map(t => t.name).join(', ') || 'No tags available.';
+             descriptionText.textContent = data.description?.captions?.[0]?.text || 'Analysis could not generate a clear description.';
+             tagsList.textContent = data.tags?.map(t => t.name).sort().join(', ') || 'No tags available.';
              if (data.objects && data.objects.length > 0) {
                 objectsList.innerHTML = '';
                 data.objects.forEach(obj => {
                     const li = document.createElement('li');
-                    li.textContent = `${obj.object_property} (${Math.round(obj.confidence * 100)}%)`;
+                    li.textContent = `${obj.object_property} (${Math.round(obj.confidence * 100).toFixed(2)}%)`;
                     objectsList.appendChild(li);
                 });
              } else {
-                objectsList.innerHTML = '<li>No objects detected.</li>';
+                objectsList.innerHTML = '<li>Confidence score too low...</li>';
              }
         }
         
