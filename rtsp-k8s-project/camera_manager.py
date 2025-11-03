@@ -22,8 +22,7 @@ SHARED_BUFFER_SIZE = FRAME_HEIGHT * FRAME_WIDTH * FRAME_CHANNELS
 
 # --- Environment Variables ---
 RTSP_STREAM_URL = os.environ.get("RTSP_STREAM_URL")
-CAMERA_SOURCE = os.environ.get("CAMERA_SOURCE", "local") # default to 'local'
-CONFIG_FILE_PATH = "/app/config/camera_source.txt"
+# CAMERA_SOURCE and CONFIG_FILE_PATH are no longer needed
 
 # Set OpenCV options for FFMPEG to be more resilient
 os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp|timeout;5000000'
@@ -47,16 +46,7 @@ def cleanup(signum, frame):
     logger.info("Shutdown complete.")
     sys.exit(0)
 
-def get_camera_source():
-    """Reads the desired camera source from the config file."""
-    try:
-        with open(CONFIG_FILE_PATH, "r") as f:
-            source = f.read().strip().lower()
-            if source in ['local', 'rtsp']:
-                return source
-    except Exception:
-        pass # File not found or invalid, fall back to env var
-    return CAMERA_SOURCE
+# get_camera_source() function is no longer needed
 
 def run_camera():
     """Main camera loop with robust reconnection."""
@@ -79,25 +69,17 @@ def run_camera():
     shared_frame_array = np.ndarray((FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS), dtype=np.uint8, buffer=shm.buf)
     
     while True:
-        source_type = get_camera_source()
-        camera_path = ""
-        
         try:
-            if source_type == 'local':
-                camera_path = 0 # Use /dev/video0
-                camera = cv2.VideoCapture(camera_path, cv2.CAP_V4L2)
-            elif source_type == 'rtsp':
-                if not RTSP_STREAM_URL:
-                    raise ValueError("CAMERA_SOURCE is 'rtsp' but RTSP_STREAM_URL is not set.")
-                camera_path = RTSP_STREAM_URL
-                camera = cv2.VideoCapture(camera_path, cv2.CAP_FFMPEG)
-            else:
-                raise ValueError(f"Invalid CAMERA_SOURCE: {source_type}")
+            if not RTSP_STREAM_URL:
+                raise ValueError("RTSP_STREAM_URL is not set.")
+                
+            camera_path = RTSP_STREAM_URL
+            camera = cv2.VideoCapture(camera_path, cv2.CAP_FFMPEG)
 
             if not camera or not camera.isOpened():
                 raise IOError(f"Failed to open camera for source: {camera_path}")
             
-            logger.info(f"Camera opened successfully ({source_type}). Starting frame capture.")
+            logger.info(f"Camera opened successfully ({camera_path}). Starting frame capture.")
 
             while True:
                 ret, frame = camera.read()

@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import base64
 import io
+from urllib.parse import urlparse, urlunparse # Added for URL sanitizing
 
 from flask import Flask, render_template, Response, jsonify, request
 from azure.cognitiveservices.vision.computervision import ComputerVisionClient
@@ -38,12 +39,34 @@ MIN_OBJECT_CONFIDENCE = 0.60  # Minimum confidence (0.0 to 1.0) required for dis
 # --- Environment Variables ---
 AZURE_VISION_KEY = os.environ.get("AZURE_VISION_SUBSCRIPTION_KEY")
 AZURE_VISION_ENDPOINT = os.environ.get("AZURE_VISION_ENDPOINT")
+RTSP_STREAM_URL = os.environ.get("RTSP_STREAM_URL")
 
 # --- InfluxDB Config (From k8s-manifest.yaml Secret) ---
 INFLUXDB_URL = os.environ.get("INFLUXDB_URL")
 INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN")
 INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG")
 INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET")
+
+# --- Create Sanitized RTSP URL for Frontend ---
+SANITIZED_RTSP_URL = "Not Configured"
+if RTSP_STREAM_URL:
+    try:
+        # Try to parse and remove user/pass
+        parsed = urlparse(RTSP_STREAM_URL)
+        # Rebuild URL without netloc user/pass
+        netloc_parts = parsed.netloc.split('@')
+        sanitized_netloc = netloc_parts[-1] # Get the part after '@', or the whole thing
+        SANITIZED_RTSP_URL = urlunparse((
+            parsed.scheme,
+            sanitized_netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment
+        ))
+    except Exception:
+        SANITIZED_RTSP_URL = "rtsp://... (Stream Configured)"
+
 
 # =============================================================================
 # INITIALIZATION
@@ -202,7 +225,9 @@ def run_analysis_task():
 @app.route('/')
 def index():
     """Serves the main HTML page."""
-    return render_template('index.html', min_confidence=MIN_OBJECT_CONFIDENCE)
+    return render_template('index.html', 
+                           min_confidence=MIN_OBJECT_CONFIDENCE,
+                           rtsp_url=SANITIZED_RTSP_URL) # Pass sanitized URL
 
 def generate_frames():
     """Generator function that yields frames from shared memory."""
@@ -322,16 +347,15 @@ def get_analysis_history():
         logger.error(f"Failed to query InfluxDB for history: {e}")
         return jsonify({'error': f"Failed to retrieve history: {str(e)}"}), 500
 
-@app.route('/get_historical_record/<timestamp>', methods=['GET'])
+@app.route('/get_historical_record/<path:timestamp>', methods=['GET'])
 def get_historical_record(timestamp):
     """Retrieves the full data record (including frame) for a specific timestamp."""
     if not query_api:
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # Convert JS ISO string to RFC3339 format for Flux
-        # 2025-11-02T22:30:00.123Z -> 2025-11-02T22:30:00.123Z
-        # This format is usually fine, but we'll be explicit
+        # The timestamp is received URL-decoded from Flask
+        # e.g., "2025-11-02T05:45:00.123Z"
         
         # We query for a very narrow time window
         query = f'''
@@ -346,6 +370,7 @@ def get_historical_record(timestamp):
         tables = query_api.query(query, org=INFLUXDB_ORG)
         
         if not tables or not tables[0].records:
+            logger.warning(f"No record found for timestamp: {timestamp}")
             return jsonify({'error': 'No record found for that timestamp.'}), 404
 
         # Reconstruct the single record from the pivoted table
@@ -364,7 +389,7 @@ def get_historical_record(timestamp):
         return jsonify(historical_record)
 
     except Exception as e:
-        logger.error(f"Failed to query InfluxDB for specific frame: {e}")
+        logger.error(f"Failed to query InfluxDB for specific frame: {e} (Timestamp: {timestamp})")
         return jsonify({'error': f"Failed to retrieve frame: {str(e)}"}), 500
 
 if __name__ == '__main__':

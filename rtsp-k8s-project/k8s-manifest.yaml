@@ -47,9 +47,6 @@ spec:
           emptyDir:
             medium: Memory # Use RAM for high-speed IPC
             sizeLimit: 128Mi
-        # 2. Config file for camera switching
-        - name: camera-config-volume
-          emptyDir: {}
       
       containers:
         # --- Container 1: The Python/Flask Web App ---
@@ -77,8 +74,6 @@ spec:
           volumeMounts:
             - name: shared-frame-memory
               mountPath: /dev/shm
-            - name: camera-config-volume
-              mountPath: /app/config
 
         # --- Container 2: The OpenCV Camera Manager ---
         - name: camera-manager
@@ -97,8 +92,6 @@ spec:
           volumeMounts:
             - name: shared-frame-memory
               mountPath: /dev/shm
-            - name: camera-config-volume
-              mountPath: /app/config
 
 ---
 # --- 3. Service ---

@@ -249,9 +249,6 @@ spec:
           emptyDir:
             medium: Memory # Use RAM for high-speed IPC
             sizeLimit: 128Mi
-        # 2. Config file for camera switching
-        - name: camera-config-volume
-          emptyDir: {}
       
       containers:
         # --- Container 1: The Python/Flask Web App ---
@@ -279,8 +276,6 @@ spec:
           volumeMounts:
             - name: shared-frame-memory
               mountPath: /dev/shm
-            - name: camera-config-volume
-              mountPath: /app/config
 
         # --- Container 2: The OpenCV Camera Manager ---
         - name: camera-manager
@@ -299,8 +294,6 @@ spec:
           volumeMounts:
             - name: shared-frame-memory
               mountPath: /dev/shm
-            - name: camera-config-volume
-              mountPath: /app/config
 
 ---
 # --- 3. Service ---
@@ -352,6 +345,7 @@ import cv2
 import numpy as np
 import base64
 import io
+from urllib.parse import urlparse, urlunparse # Added for URL sanitizing
 
 from flask import Flask, render_template, Response, jsonify, request
 from azure.cognitiveservices.vision.computervision import ComputerVisionClient
@@ -383,12 +377,34 @@ MIN_OBJECT_CONFIDENCE = 0.60  # Minimum confidence (0.0 to 1.0) required for dis
 # --- Environment Variables ---
 AZURE_VISION_KEY = os.environ.get("AZURE_VISION_SUBSCRIPTION_KEY")
 AZURE_VISION_ENDPOINT = os.environ.get("AZURE_VISION_ENDPOINT")
+RTSP_STREAM_URL = os.environ.get("RTSP_STREAM_URL")
 
 # --- InfluxDB Config (From k8s-manifest.yaml Secret) ---
 INFLUXDB_URL = os.environ.get("INFLUXDB_URL")
 INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN")
 INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG")
 INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET")
+
+# --- Create Sanitized RTSP URL for Frontend ---
+SANITIZED_RTSP_URL = "Not Configured"
+if RTSP_STREAM_URL:
+    try:
+        # Try to parse and remove user/pass
+        parsed = urlparse(RTSP_STREAM_URL)
+        # Rebuild URL without netloc user/pass
+        netloc_parts = parsed.netloc.split('@')
+        sanitized_netloc = netloc_parts[-1] # Get the part after '@', or the whole thing
+        SANITIZED_RTSP_URL = urlunparse((
+            parsed.scheme,
+            sanitized_netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment
+        ))
+    except Exception:
+        SANITIZED_RTSP_URL = "rtsp://... (Stream Configured)"
+
 
 # =============================================================================
 # INITIALIZATION
@@ -547,7 +563,9 @@ def run_analysis_task():
 @app.route('/')
 def index():
     """Serves the main HTML page."""
-    return render_template('index.html', min_confidence=MIN_OBJECT_CONFIDENCE)
+    return render_template('index.html', 
+                           min_confidence=MIN_OBJECT_CONFIDENCE,
+                           rtsp_url=SANITIZED_RTSP_URL) # Pass sanitized URL
 
 def generate_frames():
     """Generator function that yields frames from shared memory."""
@@ -667,16 +685,15 @@ def get_analysis_history():
         logger.error(f"Failed to query InfluxDB for history: {e}")
         return jsonify({'error': f"Failed to retrieve history: {str(e)}"}), 500
 
-@app.route('/get_historical_record/<timestamp>', methods=['GET'])
+@app.route('/get_historical_record/<path:timestamp>', methods=['GET'])
 def get_historical_record(timestamp):
     """Retrieves the full data record (including frame) for a specific timestamp."""
     if not query_api:
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # Convert JS ISO string to RFC3339 format for Flux
-        # 2025-11-02T22:30:00.123Z -> 2025-11-02T22:30:00.123Z
-        # This format is usually fine, but we'll be explicit
+        # The timestamp is received URL-decoded from Flask
+        # e.g., "2025-11-02T05:45:00.123Z"
         
         # We query for a very narrow time window
         query = f'''
@@ -691,6 +708,7 @@ def get_historical_record(timestamp):
         tables = query_api.query(query, org=INFLUXDB_ORG)
         
         if not tables or not tables[0].records:
+            logger.warning(f"No record found for timestamp: {timestamp}")
             return jsonify({'error': 'No record found for that timestamp.'}), 404
 
         # Reconstruct the single record from the pivoted table
@@ -709,7 +727,7 @@ def get_historical_record(timestamp):
         return jsonify(historical_record)
 
     except Exception as e:
-        logger.error(f"Failed to query InfluxDB for specific frame: {e}")
+        logger.error(f"Failed to query InfluxDB for specific frame: {e} (Timestamp: {timestamp})")
         return jsonify({'error': f"Failed to retrieve frame: {str(e)}"}), 500
 
 if __name__ == '__main__':
@@ -745,8 +763,7 @@ SHARED_BUFFER_SIZE = FRAME_HEIGHT * FRAME_WIDTH * FRAME_CHANNELS
 
 # --- Environment Variables ---
 RTSP_STREAM_URL = os.environ.get("RTSP_STREAM_URL")
-CAMERA_SOURCE = os.environ.get("CAMERA_SOURCE", "local") # default to 'local'
-CONFIG_FILE_PATH = "/app/config/camera_source.txt"
+# CAMERA_SOURCE and CONFIG_FILE_PATH are no longer needed
 
 # Set OpenCV options for FFMPEG to be more resilient
 os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp|timeout;5000000'
@@ -770,16 +787,7 @@ def cleanup(signum, frame):
     logger.info("Shutdown complete.")
     sys.exit(0)
 
-def get_camera_source():
-    """Reads the desired camera source from the config file."""
-    try:
-        with open(CONFIG_FILE_PATH, "r") as f:
-            source = f.read().strip().lower()
-            if source in ['local', 'rtsp']:
-                return source
-    except Exception:
-        pass # File not found or invalid, fall back to env var
-    return CAMERA_SOURCE
+# get_camera_source() function is no longer needed
 
 def run_camera():
     """Main camera loop with robust reconnection."""
@@ -802,25 +810,17 @@ def run_camera():
     shared_frame_array = np.ndarray((FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS), dtype=np.uint8, buffer=shm.buf)
     
     while True:
-        source_type = get_camera_source()
-        camera_path = ""
-        
         try:
-            if source_type == 'local':
-                camera_path = 0 # Use /dev/video0
-                camera = cv2.VideoCapture(camera_path, cv2.CAP_V4L2)
-            elif source_type == 'rtsp':
-                if not RTSP_STREAM_URL:
-                    raise ValueError("CAMERA_SOURCE is 'rtsp' but RTSP_STREAM_URL is not set.")
-                camera_path = RTSP_STREAM_URL
-                camera = cv2.VideoCapture(camera_path, cv2.CAP_FFMPEG)
-            else:
-                raise ValueError(f"Invalid CAMERA_SOURCE: {source_type}")
+            if not RTSP_STREAM_URL:
+                raise ValueError("RTSP_STREAM_URL is not set.")
+                
+            camera_path = RTSP_STREAM_URL
+            camera = cv2.VideoCapture(camera_path, cv2.CAP_FFMPEG)
 
             if not camera or not camera.isOpened():
                 raise IOError(f"Failed to open camera for source: {camera_path}")
             
-            logger.info(f"Camera opened successfully ({source_type}). Starting frame capture.")
+            logger.info(f"Camera opened successfully ({camera_path}). Starting frame capture.")
 
             while True:
                 ret, frame = camera.read()
@@ -920,17 +920,17 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 </div>
 
                 <!-- Controls -->
-                <div class="mt-6 flex flex-col sm:flex-row gap-4">
-                    <button id="analyzeButton" class="flex-1 bg-green-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-green-700 transition duration-300 disabled:opacity-50 disabled:cursor-not-allowed">
+                <div class="mt-6 flex flex-col gap-4">
+                    <button id="analyzeButton" class="w-full bg-green-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-green-700 transition duration-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center">
                         <span id="analyzeSpinner" class="hidden mr-2 w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
                         <span id="analyzeText">Analyze Current Frame</span>
                     </button>
-                    <button id="localCamButton" class="flex-1 bg-blue-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-blue-700 transition duration-300">
-                        Use Local Camera
-                    </button>
-                    <button id="rtspCamButton" class="flex-1 bg-blue-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-blue-700 transition duration-300">
-                        Use RTSP Stream
-                    </button>
+
+                    <!-- Sanitized RTSP URL Display -->
+                    <div class="w-full text-center p-3 bg-gray-100 rounded-lg">
+                        <span class="font-medium text-gray-700">Monitoring Stream:</span>
+                        <span class="text-gray-900 font-mono text-sm break-all">{{ rtsp_url | e }}</span>
+                    </div>
                 </div>
 
                 <!-- Status Message -->
@@ -1015,6 +1015,9 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
     </div>
 
     <script>
+        // --- Globals ---
+        let boxClearTimer = null; // Timer to clear bounding boxes
+
         // --- DOM Elements ---
         const videoFeed = document.getElementById('videoFeed');
         const overlayCanvas = document.getElementById('overlayCanvas');
@@ -1024,8 +1027,6 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
         const analyzeSpinner = document.getElementById('analyzeSpinner');
         const analyzeText = document.getElementById('analyzeText');
         
-        const localCamButton = document.getElementById('localCamButton');
-        const rtspCamButton = document.getElementById('rtspCamButton');
         const statusMessage = document.getElementById('statusMessage');
 
         // Current Analysis Elements
@@ -1058,10 +1059,6 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
         
         // Analyze Button
         analyzeButton.addEventListener('click', handleAnalyzeFrame);
-        
-        // Camera Switch Buttons
-        localCamButton.addEventListener('click', () => switchCameraSource('local'));
-        rtspCamButton.addEventListener('click', () => switchCameraSource('rtsp'));
 
         // History Buttons
         refreshHistoryBtn.addEventListener('click', loadHistory);
@@ -1105,32 +1102,12 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
             }
         }
 
-        async function switchCameraSource(source) {
-            showStatus(`Switching to ${source} stream...`);
-            localCamButton.disabled = true;
-            rtspCamButton.disabled = true;
-
-            try {
-                // This is a "fire-and-forget" request to the config file
-                // The camera_manager.py will pick up the change
-                // We've removed the /switch_camera endpoint, but if it were
-                // re-added, it would write to /app/config/camera_source.txt
-                // For now, this button won't do anything.
-                // await fetch(`/switch_camera?source=${source}`, { method: 'POST' });
-                showStatus(`Camera switching is configured by environment variables.`, true);
-                // videoFeed.src = `/video_feed?t=${new Date().getTime()}`; // Force reload
-            } catch (error) {
-                console.error('Error switching camera:', error);
-                showStatus('Error: Could not send switch request.', true);
-            } finally {
-                localCamButton.disabled = false;
-                rtspCamButton.disabled = false;
-            }
-        }
-
         async function handleAnalyzeFrame() {
             setAnalyzeButtonState(true, 'Analyzing...');
             showStatus('');
+            
+            // Clear any existing boxes and timers
+            if (boxClearTimer) clearTimeout(boxClearTimer);
             ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
             clearCurrentAnalysisDetails();
 
@@ -1160,6 +1137,12 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 populateCurrentAnalysisDetails(data);
                 drawBoxesOnCanvas(data.objects);
                 loadHistory(); // Refresh history after analysis
+
+                // **NEW**: Clear boxes after 3 seconds
+                boxClearTimer = setTimeout(() => {
+                    ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                    boxClearTimer = null;
+                }, 3000);
 
             } catch (error) {
                 console.error('Analysis error:', error);
@@ -1291,7 +1274,8 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
             
             try {
                 // 2. Fetch the full record from the new endpoint
-                const response = await fetch(`/get_historical_record/${timestamp}`);
+                // **NEW**: Use encodeURIComponent to safely pass the timestamp
+                const response = await fetch(`/get_historical_record/${encodeURIComponent(timestamp)}`);
                 if (!response.ok) {
                     let errorMsg = `HTTP Error ${response.status}`;
                     try {
@@ -1302,6 +1286,10 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 }
                 
                 const item = await response.json();
+                
+                if (item.error) {
+                    throw new Error(item.error);
+                }
 
                 // 3. Populate modal with full data
                 modalImage.src = `data:image/jpeg;base64,${item.frame_b64}`;
@@ -1364,5 +1352,3 @@ echo "✅ All files generated in $PROJECT_DIR/"
 echo "---"
 echo "IMPORTANT: Remember to manually add your 'camera_unavailable.jpg' file to the '$PROJECT_DIR/static/' directory."
 echo "Next, follow the instructions in '$PROJECT_DIR/README.md' to build, push, and deploy."
-
-

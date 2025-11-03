@@ -63,17 +63,17 @@
                 </div>
 
                 <!-- Controls -->
-                <div class="mt-6 flex flex-col sm:flex-row gap-4">
-                    <button id="analyzeButton" class="flex-1 bg-green-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-green-700 transition duration-300 disabled:opacity-50 disabled:cursor-not-allowed">
+                <div class="mt-6 flex flex-col gap-4">
+                    <button id="analyzeButton" class="w-full bg-green-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-green-700 transition duration-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center">
                         <span id="analyzeSpinner" class="hidden mr-2 w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
                         <span id="analyzeText">Analyze Current Frame</span>
                     </button>
-                    <button id="localCamButton" class="flex-1 bg-blue-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-blue-700 transition duration-300">
-                        Use Local Camera
-                    </button>
-                    <button id="rtspCamButton" class="flex-1 bg-blue-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-blue-700 transition duration-300">
-                        Use RTSP Stream
-                    </button>
+
+                    <!-- Sanitized RTSP URL Display -->
+                    <div class="w-full text-center p-3 bg-gray-100 rounded-lg">
+                        <span class="font-medium text-gray-700">Monitoring Stream:</span>
+                        <span class="text-gray-900 font-mono text-sm break-all">{{ rtsp_url | e }}</span>
+                    </div>
                 </div>
 
                 <!-- Status Message -->
@@ -158,6 +158,9 @@
     </div>
 
     <script>
+        // --- Globals ---
+        let boxClearTimer = null; // Timer to clear bounding boxes
+
         // --- DOM Elements ---
         const videoFeed = document.getElementById('videoFeed');
         const overlayCanvas = document.getElementById('overlayCanvas');
@@ -167,8 +170,6 @@
         const analyzeSpinner = document.getElementById('analyzeSpinner');
         const analyzeText = document.getElementById('analyzeText');
         
-        const localCamButton = document.getElementById('localCamButton');
-        const rtspCamButton = document.getElementById('rtspCamButton');
         const statusMessage = document.getElementById('statusMessage');
 
         // Current Analysis Elements
@@ -201,10 +202,6 @@
         
         // Analyze Button
         analyzeButton.addEventListener('click', handleAnalyzeFrame);
-        
-        // Camera Switch Buttons
-        localCamButton.addEventListener('click', () => switchCameraSource('local'));
-        rtspCamButton.addEventListener('click', () => switchCameraSource('rtsp'));
 
         // History Buttons
         refreshHistoryBtn.addEventListener('click', loadHistory);
@@ -248,32 +245,12 @@
             }
         }
 
-        async function switchCameraSource(source) {
-            showStatus(`Switching to ${source} stream...`);
-            localCamButton.disabled = true;
-            rtspCamButton.disabled = true;
-
-            try {
-                // This is a "fire-and-forget" request to the config file
-                // The camera_manager.py will pick up the change
-                // We've removed the /switch_camera endpoint, but if it were
-                // re-added, it would write to /app/config/camera_source.txt
-                // For now, this button won't do anything.
-                // await fetch(`/switch_camera?source=${source}`, { method: 'POST' });
-                showStatus(`Camera switching is configured by environment variables.`, true);
-                // videoFeed.src = `/video_feed?t=${new Date().getTime()}`; // Force reload
-            } catch (error) {
-                console.error('Error switching camera:', error);
-                showStatus('Error: Could not send switch request.', true);
-            } finally {
-                localCamButton.disabled = false;
-                rtspCamButton.disabled = false;
-            }
-        }
-
         async function handleAnalyzeFrame() {
             setAnalyzeButtonState(true, 'Analyzing...');
             showStatus('');
+            
+            // Clear any existing boxes and timers
+            if (boxClearTimer) clearTimeout(boxClearTimer);
             ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
             clearCurrentAnalysisDetails();
 
@@ -303,6 +280,12 @@
                 populateCurrentAnalysisDetails(data);
                 drawBoxesOnCanvas(data.objects);
                 loadHistory(); // Refresh history after analysis
+
+                // **NEW**: Clear boxes after 3 seconds
+                boxClearTimer = setTimeout(() => {
+                    ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                    boxClearTimer = null;
+                }, 3000);
 
             } catch (error) {
                 console.error('Analysis error:', error);
@@ -434,7 +417,8 @@
             
             try {
                 // 2. Fetch the full record from the new endpoint
-                const response = await fetch(`/get_historical_record/${timestamp}`);
+                // **NEW**: Use encodeURIComponent to safely pass the timestamp
+                const response = await fetch(`/get_historical_record/${encodeURIComponent(timestamp)}`);
                 if (!response.ok) {
                     let errorMsg = `HTTP Error ${response.status}`;
                     try {
@@ -445,6 +429,10 @@
                 }
                 
                 const item = await response.json();
+                
+                if (item.error) {
+                    throw new Error(item.error);
+                }
 
                 // 3. Populate modal with full data
                 modalImage.src = `data:image/jpeg;base64,${item.frame_b64}`;
