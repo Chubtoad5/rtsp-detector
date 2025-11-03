@@ -53,15 +53,21 @@ def run_camera():
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
 
-    try:
-        # Create or connect to the shared memory block
-        try:
-            shm = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHARED_BUFFER_SIZE)
-            logger.info(f"Shared memory block '{SHM_NAME}' created.")
-        except FileExistsError:
-            shm = shared_memory.SharedMemory(name=SHM_NAME, create=False, size=SHARED_BUFFER_SIZE)
-            logger.info(f"Shared memory block '{SHM_NAME}' already exists, connecting.")
+    # --- FIX: Removed outer unnecessary 'try:' block ---
     
+    # Create or connect to the shared memory block
+    try:
+        shm = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHARED_BUFFER_SIZE)
+        logger.info(f"Shared memory block '{SHM_NAME}' created.")
+    except FileExistsError:
+        shm = shared_memory.SharedMemory(name=SHM_NAME, create=False, size=SHARED_BUFFER_SIZE)
+        logger.info(f"Shared memory block '{SHM_NAME}' already exists, connecting.")
+    except Exception as e:
+        # Handle case where SHM fails entirely (e.g., system resource limit)
+        logger.error(f"FATAL: Failed to create/connect to shared memory: {e}")
+        # Terminate gracefully since the app cannot function without shared memory
+        cleanup(signal.SIGTERM, None) 
+
     # Create a NumPy array backed by the shared memory buffer
     shared_frame_array = np.ndarray((FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS), dtype=np.uint8, buffer=shm.buf)
     
@@ -76,12 +82,11 @@ def run_camera():
             if not camera or not camera.isOpened():
                 raise IOError(f"Failed to open camera for source: {camera_path}")
             
-            # --- FIX #2: Latency Reduction ---
+            # --- Latency Reduction ---
             # 1. Set buffer size to 1 frame to minimize buffering
             camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             # 2. Read and discard initial frames to clear the stream buffer (fast grab)
-            # This is essential for low-latency RTSP feeds
             for _ in range(5): 
                 camera.grab() 
 
