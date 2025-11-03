@@ -1,0 +1,67 @@
+# --- InfluxDB v2 Deployment ---
+# This manifest creates a standalone InfluxDB pod with persistent storage.
+# It uses the 'local-path' provisioner available in RKE2.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: influxdb-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path # Uses RKE2's default provisioner
+  resources:
+    requests:
+      storage: 5Gi # Allocate 5GB for the database
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: influxdb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: influxdb
+  template:
+    metadata:
+      labels:
+        app: influxdb
+    spec:
+      containers:
+        - name: influxdb
+          image: influxdb:2.7.5-alpine
+          ports:
+            - containerPort: 8086
+          env:
+            - name: DOCKER_INFLUXDB_INIT_MODE
+              value: "setup"
+            - name: DOCKER_INFLUXDB_INIT_USERNAME
+              value: "admin"
+            - name: DOCKER_INFLUXDB_INIT_PASSWORD
+              value: "adminpassword" # Not used for token auth, but good to set
+            - name: DOCKER_INFLUXDB_INIT_ORG
+              value: "rtsp-project-org"
+            - name: DOCKER_INFLUXDB_INIT_BUCKET
+              value: "analysis_data"
+            - name: DOCKER_INFLUXDB_INIT_ADMIN_TOKEN
+              value: "YOUR_INFLUXDB_TOKEN" # !!! REPLACE THIS WITH YOUR SECURE TOKEN !!!
+          volumeMounts:
+            - name: influxdb-storage
+              mountPath: /var/lib/influxdb2
+      volumes:
+        - name: influxdb-storage
+          persistentVolumeClaim:
+            claimName: influxdb-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: influxdb-service
+spec:
+  selector:
+    app: influxdb
+  ports:
+    - protocol: TCP
+      port: 8086
+      targetPort: 8086

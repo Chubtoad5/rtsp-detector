@@ -1,28 +1,36 @@
+# This manifest contains all resources for the main application.
+# It uses a single pod with two containers (web-app, camera-manager)
+# that communicate via a shared in-memory volume.
+
+# --- 1. Secret ---
+# Holds all confidential data
 apiVersion: v1
 kind: Secret
 metadata:
   name: rtsp-config
 type: Opaque
 stringData:
-  # --- REQUIRED: Replace these with your actual Azure credentials ---
+  # --- Azure Credentials ---
   AZURE_VISION_SUBSCRIPTION_KEY: "YOUR_AZURE_KEY_HERE"
   AZURE_VISION_ENDPOINT: "https://your-endpoint.cognitiveservices.azure.com/"
-  RTSP_STREAM_URL: "rtsp://your-stream-url-here"
-  CAMERA_SOURCE: "rtsp" 
   
-  # --- NEW: InfluxDB Connection Details (MUST MATCH k8s-influxdb.yaml) ---
+  # --- Camera Configuration ---
+  CAMERA_SOURCE: "rtsp"
+  RTSP_STREAM_URL: "rtsp://your-stream-url-here"
+  
+  # --- InfluxDB Connection Details (MUST MATCH k8s-influxdb.yaml) ---
   INFLUXDB_URL: "http://influxdb-service:8086"
-  INFLUXDB_TOKEN: "YOUR_INFLUXDB_TOKEN" # !!! REPLACE THIS WITH YOUR SECURE TOKEN !!!
+  INFLUXDB_TOKEN: "YOUR_INFLUXDB_TOKEN" # !!! REPLACE THIS WITH THE SAME TOKEN !!!
   INFLUXDB_ORG: "rtsp-project-org"
   INFLUXDB_BUCKET: "analysis_data"
 
 ---
+# --- 2. Deployment ---
+# Deploys the application pod
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rtsp-object-detector
-  labels:
-    app: rtsp-object-detector
 spec:
   replicas: 1
   selector:
@@ -34,48 +42,71 @@ spec:
         app: rtsp-object-detector
     spec:
       volumes:
-        # Volume for inter-container communication (Shared Memory replacement)
-        - name: shm-volume
+        # 1. Shared memory volume for IPC between containers
+        - name: shared-frame-memory
           emptyDir:
-            medium: Memory # Use RAM for speed
-            sizeLimit: 10Mi # Limit memory usage
+            medium: Memory # Use RAM for high-speed IPC
+            sizeLimit: 128Mi
+        # 2. Config file for camera switching
+        - name: camera-config-volume
+          emptyDir: {}
+      
       containers:
-        # 1. Web Application Container
+        # --- Container 1: The Python/Flask Web App ---
         - name: web-app
-          image: your-registry/rtsp-object-detector:latest # !!! REPLACE WITH YOUR IMAGE PATH !!!
-          command: ["gunicorn", "-b", "0.0.0.0:8000", "-k", "gevent", "app:app"]
+          # !!! REPLACE THIS with your new versioned image !!!
+          image: "your-registry/rtsp-object-detector:v1"
+          imagePullPolicy: Always # Ensures the new image is pulled
           ports:
             - containerPort: 8000
-          volumeMounts:
-            - name: shm-volume
-              mountPath: /dev/shm # Mount the emptyDir as the shared memory location
+          
+          # Command to run Gunicorn
+          command: ["gunicorn"]
+          args: [
+            "--workers", "3",
+            "--worker-class", "gevent",
+            "--bind", "0.0.0.0:8000",
+            "--log-level", "info",
+            "app:app"
+          ]
+          
           envFrom:
             - secretRef:
-                name: rtsp-config
-          resources:
-            limits:
-              memory: "1Gi"
-              cpu: "1000m"
+                name: rtsp-config # Mounts all secrets as env variables
+          
+          volumeMounts:
+            - name: shared-frame-memory
+              mountPath: /dev/shm
+            - name: camera-config-volume
+              mountPath: /app/config
 
-        # 2. Camera Manager Container
+        # --- Container 2: The OpenCV Camera Manager ---
         - name: camera-manager
-          image: your-registry/rtsp-object-detector:latest # !!! REPLACE WITH YOUR IMAGE PATH !!!
-          command: ["python3", "camera_manager.py"]
-          volumeMounts:
-            - name: shm-volume
-              mountPath: /dev/shm # Mount the emptyDir as the shared memory location
+          # !!! REPLACE THIS with your new versioned image !!!
+          image: "your-registry/rtsp-object-detector:v1"
+          imagePullPolicy: Always # Ensures the new image is pulled
+          
+          # Command to run the camera manager script
+          command: ["python3"]
+          args: ["camera_manager.py"]
+          
           envFrom:
             - secretRef:
-                name: rtsp-config
-          resources:
-            limits:
-              memory: "512Mi"
-              cpu: "500m"
+                name: rtsp-config # Mounts all secrets as env variables
+          
+          volumeMounts:
+            - name: shared-frame-memory
+              mountPath: /dev/shm
+            - name: camera-config-volume
+              mountPath: /app/config
+
 ---
+# --- 3. Service ---
+# Exposes the web-app container inside the cluster
 apiVersion: v1
 kind: Service
 metadata:
-  name: rtsp-object-detector-service
+  name: rtsp-detector-service
 spec:
   selector:
     app: rtsp-object-detector
@@ -85,21 +116,22 @@ spec:
       targetPort: 8000
 
 ---
+# --- 4. Ingress ---
+# Exposes the service to the internet via your Nginx Ingress Controller
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: rtsp-detector-ingress
-  annotations:
-    nginx.ingress.kubernetes.io/ssl-redirect: "false"
 spec:
   rules:
-  - host: rtsp-detector.your-domain.com # !!! REPLACE THIS WITH YOUR HOSTNAME !!!
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: rtsp-object-detector-service
-            port:
-              number: 80
+    # !!! REPLACE THIS with your public domain !!!
+    - host: "rtsp-detector.your-domain.com"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rtsp-detector-service
+                port:
+                  number: 80

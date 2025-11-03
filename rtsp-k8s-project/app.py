@@ -6,6 +6,7 @@ import multiprocessing.shared_memory as shared_memory
 import cv2
 import numpy as np
 import base64
+import io
 
 from flask import Flask, render_template, Response, jsonify, request
 from azure.cognitiveservices.vision.computervision import ComputerVisionClient
@@ -14,7 +15,7 @@ from msrest.authentication import CognitiveServicesCredentials
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 from datetime import datetime
-import datetime as dt # Added for timedelta
+import datetime as dt # Use a distinct alias for timedelta
 
 # =============================================================================
 # CONFIGURATION
@@ -47,15 +48,20 @@ INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET")
 # =============================================================================
 # INITIALIZATION
 # =============================================================================
+shm = None
+shared_frame_array = None
 
-# 1. Initialize Shared Memory
-try:
-    shm = shared_memory.SharedMemory(name=SHM_NAME)
-    shared_frame_array = np.ndarray((FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS), dtype=np.uint8, buffer=shm.buf)
-    logger.info("Web app connected to shared memory for video feed.")
-except FileNotFoundError:
-    logger.error("Shared memory block not found. Is camera_manager running?")
-    shared_frame_array = None
+def get_shared_memory():
+    """Connects to shared memory, retrying if needed."""
+    global shm, shared_frame_array
+    while shm is None:
+        try:
+            shm = shared_memory.SharedMemory(name=SHM_NAME)
+            shared_frame_array = np.ndarray((FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS), dtype=np.uint8, buffer=shm.buf)
+            logger.info("Web app connected to shared memory for video feed.")
+        except FileNotFoundError:
+            logger.warning("Shared memory block not found. Is camera_manager running? Retrying in 5s...")
+            time.sleep(5)
 
 # 2. Initialize Azure Computer Vision Client
 if AZURE_VISION_KEY and AZURE_VISION_ENDPOINT:
@@ -89,18 +95,17 @@ def draw_bounding_boxes(frame, objects):
     """Draws bounding boxes and confidence scores onto the frame."""
     frame_with_boxes = frame.copy()
     for obj in objects:
-        confidence = obj['confidence']
-        # Only draw if confidence meets the client-side threshold
+        confidence = obj.get('confidence', 0)
+        # Only draw if confidence meets the threshold
         if confidence >= MIN_OBJECT_CONFIDENCE:
-            box = obj['rectangle']
-            # Scale coordinates to fit the 720x1280 frame
-            x, y, w, h = box['x'], box['y'], box['w'], box['h']
+            box = obj.get('rectangle', {})
+            x, y, w, h = box.get('x',0), box.get('y',0), box.get('w',0), box.get('h',0)
             
             # Draw rectangle (color BGR: Blue)
             cv2.rectangle(frame_with_boxes, (x, y), (x + w, y + h), (255, 0, 0), 2)
             
             # Put label and confidence text
-            label = f"{obj['object_property']} {confidence:.0%}"
+            label = f"{obj.get('object_property', 'N/A')} {confidence:.0%}"
             cv2.putText(frame_with_boxes, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
     return frame_with_boxes
 
@@ -115,7 +120,7 @@ def save_analysis_to_db(analysis_data, frame_b64):
         point = Point("analysis_record").tag("source", "rtsp-stream")
 
         # Add data fields
-        point.field("description", analysis_data.get('description', ''))
+        point.field("description", analysis_data.get('description_text', ''))
         point.field("tags_json", json.dumps(analysis_data.get('tags', [])))
         point.field("objects_json", json.dumps(analysis_data.get('objects', [])))
         point.field("object_count", len(analysis_data.get('objects', [])))
@@ -129,42 +134,58 @@ def save_analysis_to_db(analysis_data, frame_b64):
 
 def run_analysis_task():
     """Captures the current frame, sends it to Azure, and returns the analysis."""
-    if shared_frame_array is None or cv_client is None:
-        return {'error': 'Service not initialized.'}
+    if shared_frame_array is None:
+        get_shared_memory() # Attempt to reconnect
+        if shared_frame_array is None:
+             return {'error': 'Shared memory not available.'}
+             
+    if cv_client is None:
+        return {'error': 'Azure client not initialized.'}
 
     # 1. Capture the current frame from shared memory
     current_frame = shared_frame_array.copy()
 
     # 2. Encode frame to memory buffer (JPEG format)
-    _, buffer = cv2.imencode('.jpg', current_frame)
-    image_bytes = buffer.tobytes()
+    ret, buffer = cv2.imencode('.jpg', current_frame)
+    if not ret:
+        return {'error': 'Failed to encode frame.'}
+    image_bytes_io = io.BytesIO(buffer.tobytes())
 
     # 3. Call Azure Computer Vision
     try:
         analysis_features = ['Description', 'Tags', 'Objects']
-        
-        # Use a dummy read operation to trigger the API call with the image_bytes stream
-        analysis = cv_client.analyze_image_in_stream(image_bytes, analysis_features, language="en")
+        analysis = cv_client.analyze_image_in_stream(image_bytes_io, analysis_features, language="en")
         
         # 4. Filter objects by confidence score (Server-side filtering)
         filtered_objects = [
             obj for obj in analysis.objects if obj.confidence >= MIN_OBJECT_CONFIDENCE
         ]
 
-        # 5. Compile results
+        # 5. Compile results into simple dicts
+        serializable_objects = [
+            {'object_property': obj.object_property, 'confidence': obj.confidence, 'rectangle': obj.rectangle.as_dict()}
+            for obj in filtered_objects
+        ]
+        serializable_tags = [
+            {'name': tag.name, 'confidence': tag.confidence}
+            for tag in analysis.tags
+        ]
+        description_text = ""
+        if analysis.description and analysis.description.captions:
+            description_text = analysis.description.captions[0].text
+        
         results = {
-            'description': analysis.description,
-            'tags': analysis.tags,
-            # Convert SDK objects to serializable dicts
-            'objects': [{'object_property': obj.object_property, 'confidence': obj.confidence, 'rectangle': obj.rectangle.as_dict()} for obj in filtered_objects]
+            'description_text': description_text,
+            'tags': serializable_tags,
+            'objects': serializable_objects
         }
         
         # 6. Prepare the frame for saving (with boxes drawn for history)
-        frame_with_boxes = draw_bounding_boxes(current_frame, results['objects'])
+        frame_with_boxes = draw_bounding_boxes(current_frame, serializable_objects)
         _, buffer_boxes = cv2.imencode('.jpg', frame_with_boxes)
         frame_b64 = base64.b64encode(buffer_boxes.tobytes()).decode('utf-8')
         
-        # 7. Save to InfluxDB asynchronously (or synchronously for simplicity here)
+        # 7. Save to InfluxDB
         save_analysis_to_db(results, frame_b64)
 
         return results
@@ -180,12 +201,17 @@ def run_analysis_task():
 
 @app.route('/')
 def index():
+    """Serves the main HTML page."""
     return render_template('index.html', min_confidence=MIN_OBJECT_CONFIDENCE)
 
 def generate_frames():
     """Generator function that yields frames from shared memory."""
     if shared_frame_array is None:
+        get_shared_memory() # Attempt to reconnect
+    
+    if shared_frame_array is None:
         logger.error("Cannot stream: Shared memory not connected.")
+        # Optional: Yield a "camera unavailable" image here
         return
 
     while True:
@@ -194,19 +220,23 @@ def generate_frames():
             frame = shared_frame_array.copy()
             
             # Encode frame to JPEG format
-            _, buffer = cv2.imencode('.jpeg', frame)
+            ret, buffer = cv2.imencode('.jpeg', frame)
+            if not ret:
+                continue
+            
             frame_bytes = buffer.tobytes()
 
             # Yield the frame for streaming
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             
-            # Simple rate limiting for streaming
-            time.sleep(1/30) 
+            time.sleep(1/30) # 30 FPS cap
 
         except Exception as e:
             logger.error(f"Error streaming frame: {e}")
-            break
+            # This can happen if the shared memory is closed
+            get_shared_memory() # Try to reconnect
+            time.sleep(1)
 
 @app.route('/video_feed')
 def video_feed():
@@ -232,9 +262,8 @@ def get_analysis_history():
 
     try:
         # --- FIX for Schema Collision Error ---
-        # 1. Filter out the integer field 'object_count' from the main query 
-        #    to guarantee only string values are returned in the _value column.
-        query = f'''
+        # 1. Query for all STRING fields first.
+        query_strings = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
           |> range(start: -30d) 
           |> filter(fn: (r) => r._measurement == "analysis_record" and r._field != "object_count")
@@ -242,53 +271,50 @@ def get_analysis_history():
           |> limit(n: 50) 
         '''
         
-        tables = query_api.query(query, org=INFLUXDB_ORG)
+        tables_strings = query_api.query(query_strings, org=INFLUXDB_ORG)
         
-        # Dictionary to aggregate all fields for a single timestamp
         time_to_data = {}
-        
-        for table in tables:
+        for table in tables_strings:
             for record in table.records:
                 ts = record.values['_time'].isoformat()
-                
                 if ts not in time_to_data:
                     time_to_data[ts] = {'timestamp': ts}
                 
-                # Assign the field value based on its key
                 field_name = record.values['_field']
                 field_value = record.values['_value']
-                
                 time_to_data[ts][field_name] = field_value
 
-        # 2. Get the integer 'object_count' records separately
-        count_query = f'''
+        # 2. Query for the INTEGER field 'object_count' separately.
+        query_int = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
           |> range(start: -30d) 
           |> filter(fn: (r) => r._measurement == "analysis_record" and r._field == "object_count")
           |> sort(columns: ["_time"], desc: true)
           |> limit(n: 50) 
         '''
-        count_tables = query_api.query(count_query, org=INFLUXDB_ORG)
+        tables_int = query_api.query(query_int, org=INFLUXDB_ORG)
         
-        # Merge object_count back into time_to_data
-        for table in count_tables:
+        # 3. Merge integer data back into the main dictionary.
+        for table in tables_int:
             for record in table.records:
                 ts = record.values['_time'].isoformat()
-                if ts in time_to_data:
+                if ts in time_to_data: # Only add if we have the string data
                     time_to_data[ts]['object_count'] = record.values['_value']
 
 
-        # Convert the aggregated dictionary values into a sorted list
-        # Filter out incomplete records (those missing the frame or description)
+        # Convert dict to a list
+        history_list = list(time_to_data.values())
+        
+        # Filter out any incomplete records (e.g., if one query missed a timestamp)
         history_list = [
-            data for ts, data in time_to_data.items()
-            if 'description' in data and 'frame_b64' in data
+            data for data in history_list
+            if 'description' in data and 'frame_b64' in data and 'object_count' in data
         ]
         
         # Sort by timestamp descending
         history_list.sort(key=lambda x: x['timestamp'], reverse=True)
         
-        return jsonify(history_list)
+        return jsonify(history_list[:10]) # Return top 10 recent complete records
 
     except Exception as e:
         logger.error(f"Failed to query InfluxDB for history: {e}")
@@ -297,46 +323,11 @@ def get_analysis_history():
 @app.route('/get_historical_frame/<timestamp>', methods=['GET'])
 def get_historical_frame(timestamp):
     """Retrieves the full data record for a specific timestamp."""
-    if not query_api:
-        return jsonify({'error': 'InfluxDB client is not ready.'}), 503
+    # This route is no longer needed, as /get_analysis_history now sends
+    # all data needed for the modal, including the frame_b64.
+    # We will leave it here but it's unused by the new index.html.
+    return jsonify({'error': 'This endpoint is deprecated.'}), 404
 
-    try:
-        # Convert timestamp string back to datetime object to use in Flux query range
-        ts_dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-        
-        # Define a narrow time window around the timestamp
-        start_time = ts_dt.strftime('%Y-%m-%dT%H:%M:%S.%NZ')
-        # Use timedelta from the imported dt library
-        end_time = (ts_dt + dt.timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%S.%NZ')
-        
-        query = f'''
-        from(bucket: "{INFLUXDB_BUCKET}")
-          |> range(start: {start_time}, stop: {end_time}) 
-          |> filter(fn: (r) => r._measurement == "analysis_record" and r._time == {start_time})
-        '''
-        
-        tables = query_api.query(query, org=INFLUXDB_ORG)
-        
-        # Reconstruct the single record
-        historical_record = {'timestamp': timestamp}
-        
-        for table in tables:
-            for record in table.records:
-                field_name = record.values['_field']
-                field_value = record.values['_value']
-                
-                # Explicitly cast integer fields back to int if needed
-                if field_name == 'object_count':
-                    historical_record[field_name] = int(field_value)
-                else:
-                    historical_record[field_name] = field_value
-        
-        if 'frame_b64' not in historical_record:
-            return jsonify({'error': 'Historical record not found or incomplete.'}), 404
-
-        # Successfully found and reconstructed the single record
-        return jsonify(historical_record)
-
-    except Exception as e:
-        logger.error(f"Failed to query InfluxDB for specific frame: {e}")
-        return jsonify({'error': f"Failed to retrieve frame: {str(e)}"}), 500
+if __name__ == '__main__':
+    # This is for local development only
+    app.run(host='0.0.0.0', port=8000, debug=True)

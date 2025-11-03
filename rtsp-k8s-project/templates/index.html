@@ -4,318 +4,440 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RTSP Object Detector</title>
+    <!-- 
+      Tailwind is used for rapid prototyping. 
+      For production, you should use the Tailwind CLI/PostCSS.
+    -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <style>
-        body { font-family: 'Inter', sans-serif; background-color: #f3f4f6; }
-        .stream-container { position: relative; width: 100%; max-width: 1280px; margin: 0 auto; background-color: #000; border-radius: 0.5rem; overflow: hidden; }
-        #videoFeed { display: block; width: 100%; height: auto; }
-        .analysis-area { height: 100%; }
-        /* Style for scrollable history list */
-        .history-list { overflow-y: auto; max-height: 20rem; } 
-        .history-item { cursor: pointer; transition: background-color 0.2s; }
-        .history-item:hover { background-color: #f3f4f6; }
-        
-        /* Modal Styles */
-        .modal-content { max-width: 800px; }
+        body { font-family: 'Inter', sans-serif; }
+        .video-container {
+            width: 100%;
+            max-width: 1280px;
+            aspect-ratio: 16 / 9;
+            position: relative;
+            background-color: #000;
+        }
+        #videoFeed {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        #overlayCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        /* Modal styles */
+        .modal {
+            transition: opacity 0.25s ease;
+        }
+        .modal-content {
+            transition: all 0.25s ease;
+            max-height: 90vh;
+        }
     </style>
 </head>
-<body class="p-4 md:p-8">
+<body class="bg-gray-100 text-gray-900">
 
-    <div class="max-w-7xl mx-auto">
-        <header class="text-center mb-6">
-            <h1 class="text-4xl font-extrabold text-gray-900 mb-2">RTSP Stream Analyzer</h1>
-            <p class="text-gray-600">Real-time object detection and historical analysis with Azure &amp; InfluxDB</p>
-        </header>
+    <div class="container mx-auto p-4 max-w-7xl">
+        <h1 class="text-3xl font-bold text-center text-blue-700 mb-6">RTSP Object Detector</h1>
 
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            
+            <!-- Main Content: Video and Analysis -->
+            <div class="lg:col-span-2 bg-white p-6 rounded-lg shadow-lg">
+                <div class="video-container rounded-lg overflow-hidden shadow-inner border border-gray-300">
+                    <img id="videoFeed" src="{{ url_for('video_feed') }}" alt="Video Stream">
+                    <canvas id="overlayCanvas"></canvas>
+                </div>
 
-            <!-- 1. Video Stream and Controls -->
-            <div class="lg:col-span-2">
-                <div class="bg-white shadow-xl rounded-lg overflow-hidden p-4">
-                    <h2 class="text-xl font-semibold text-gray-800 mb-3">Live Video Stream</h2>
-                    <div class="stream-container border-4 border-gray-300 rounded-lg">
-                        <img id="videoFeed" src="/video_feed" alt="RTSP Live Stream" onerror="this.src='/static/camera_unavailable.jpg'">
+                <!-- Controls -->
+                <div class="mt-6 flex flex-col sm:flex-row gap-4">
+                    <button id="analyzeButton" class="flex-1 bg-green-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-green-700 transition duration-300 disabled:opacity-50 disabled:cursor-not-allowed">
+                        <span id="analyzeSpinner" class="hidden mr-2 w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                        <span id="analyzeText">Analyze Current Frame</span>
+                    </button>
+                    <button id="localCamButton" class="flex-1 bg-blue-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-blue-700 transition duration-300">
+                        Use Local Camera
+                    </button>
+                    <button id="rtspCamButton" class="flex-1 bg-blue-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-blue-700 transition duration-300">
+                        Use RTSP Stream
+                    </button>
+                </div>
+
+                <!-- Status Message -->
+                <div id="statusMessage" class="mt-4 text-center font-medium min-h-[1.5em]"></div>
+
+                <!-- Current Analysis Results -->
+                <div class="mt-6">
+                    <h2 class="text-2xl font-semibold border-b border-gray-300 pb-2 mb-4">Current Analysis</h2>
+                    <div id="currentAnalysisResults" class="space-y-3">
+                        <p><strong>Description:</strong> <span id="descriptionText" class="text-gray-700">No analysis yet.</span></p>
+                        <p><strong>Tags:</strong> <span id="tagsList" class="text-gray-700">No analysis yet.</span></p>
+                        <div>
+                            <p><strong>Detected Objects (Min. {{ (min_confidence * 100) }}% confidence):</strong></p>
+                            <ul id="objectsList" class="list-disc list-inside text-gray-700 pl-4">
+                                <li>No analysis yet.</li>
+                            </ul>
+                        </div>
                     </div>
-
-                    <div class="mt-4 flex flex-col sm:flex-row gap-4">
-                        <button id="analyzeButton" class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-4 rounded-lg shadow-md transition duration-150 active:bg-indigo-800">
-                            <i class="fas fa-camera mr-2"></i> Analyze Current Frame
-                        </button>
-                        <!-- Camera Switch Buttons omitted for brevity as per previous instructions -->
-                    </div>
-
-                    <div id="statusMessage" class="mt-4 p-3 rounded-lg text-center font-medium text-gray-700 bg-gray-100 hidden"></div>
                 </div>
             </div>
 
-            <!-- 2. Real-Time Analysis and History Sidebars -->
-            <div class="flex flex-col gap-6 lg:col-span-1">
-                
-                <!-- Real-Time Analysis Results -->
-                <div class="bg-white shadow-xl rounded-lg p-4 analysis-area">
-                    <h2 class="text-xl font-semibold text-indigo-600 mb-3 border-b pb-2">Real-Time Results</h2>
-                    
-                    <h3 class="font-bold text-gray-700 mb-1">Description:</h3>
-                    <p id="descriptionText" class="text-sm text-gray-600 mb-3 italic">Click 'Analyze Current Frame' to run the Azure Computer Vision analysis.</p>
-
-                    <h3 class="font-bold text-gray-700 mb-1">Tags:</h3>
-                    <p id="tagsList" class="text-sm text-gray-600 mb-3 break-words">-</p>
-
-                    <h3 class="font-bold text-gray-700 mb-1">Detected Objects (Filtered):</h3>
-                    <ul id="objectsList" class="list-disc ml-5 text-sm space-y-1">
-                        <li>No objects detected.</li>
-                    </ul>
+            <!-- Sidebar: Analysis History -->
+            <div class="lg:col-span-1 bg-white p-6 rounded-lg shadow-lg">
+                <h2 class="text-2xl font-semibold border-b border-gray-300 pb-2 mb-4">Analysis History</h2>
+                <button id="refreshHistoryBtn" class="w-full bg-gray-200 hover:bg-gray-300 text-gray-800 font-semibold py-2 px-4 rounded-lg transition duration-300 mb-4">
+                    Refresh History
+                </button>
+                <div id="historyError" class="text-red-600 mb-4 hidden"></div>
+                <div id="historyList" class="space-y-3 max-h-[600px] overflow-y-auto">
+                    <p id="historyLoading" class="text-gray-500">Loading history...</p>
+                    <!-- History items will be injected here -->
                 </div>
-                
-                <!-- Historical Analysis -->
-                <div class="bg-white shadow-xl rounded-lg p-4 flex-1">
-                    <h2 class="text-xl font-semibold text-indigo-600 mb-3 border-b pb-2">Analysis History (Last 5)</h2>
-                    <ul id="historyList" class="space-y-2 history-list">
-                        <li class="text-gray-500 text-sm italic">Loading history...</li>
-                    </ul>
-                    <div id="historyMessage" class="mt-3 text-sm text-center text-red-500 hidden"></div>
-                </div>
-
             </div>
 
         </div>
-        
-        <!-- 3. Historical Frame Viewer Modal -->
-        <div id="historyModal" class="fixed inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-center z-50 transition-opacity duration-300 opacity-0 pointer-events-none">
-            <div class="bg-white rounded-lg shadow-2xl modal-content w-full mx-4 p-6 transform translate-y-4 transition-transform duration-300">
-                <div class="flex justify-between items-center border-b pb-3 mb-4">
-                    <h2 id="modalTitle" class="text-2xl font-bold text-gray-800">Historical Frame Analysis</h2>
-                    <button id="closeModal" class="text-gray-500 hover:text-gray-800 text-3xl leading-none">&times;</button>
-                </div>
-                
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <!-- Image Display -->
-                    <div class="md:col-span-2">
-                        <img id="historicalFrame" src="" alt="Historical Frame with Bounding Boxes" class="w-full rounded-lg shadow-md border-2 border-gray-200">
-                    </div>
-                    
-                    <!-- Metadata Display -->
-                    <div class="md:col-span-1 p-2">
-                        <h3 class="font-bold text-gray-700 mb-1 text-lg">Metadata:</h3>
-                        <p class="text-sm text-gray-600 mb-2"><span class="font-semibold">Time:</span> <span id="modalTimestamp"></span></p>
-                        <p class="text-sm text-gray-600 mb-2"><span class="font-semibold">Description:</span> <span id="modalDescription"></span></p>
-                        <p class="text-sm text-gray-600 mb-2"><span class="font-semibold">Objects Found:</span> <span id="modalObjectCount"></span></p>
-                        
-                        <h4 class="font-bold text-gray-700 mt-4 mb-1">Tags:</h4>
-                        <p id="modalTags" class="text-sm text-gray-600 break-words">-</p>
+    </div>
 
-                        <h4 class="font-bold text-gray-700 mt-4 mb-1">Detected Objects:</h4>
-                        <ul id="modalObjects" class="list-disc ml-5 text-sm space-y-1 text-gray-600">
-                            <li>None</li>
+    <!-- History Detail Modal -->
+    <div id="historyModal" class="modal fixed inset-0 z-50 flex items-center justify-center p-4 bg-black bg-opacity-75 opacity-0 pointer-events-none">
+        <div class="modal-content bg-white rounded-lg shadow-2xl w-full max-w-4xl transform scale-95 opacity-0 overflow-y-auto">
+            <div class="flex justify-between items-center p-6 border-b">
+                <h2 class="text-2xl font-semibold">Historical Analysis</h2>
+                <button id="closeModalBtn" class="text-gray-500 hover:text-gray-800 text-3xl">&times;</button>
+            </div>
+            <div class="p-6 grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- Modal Image -->
+                <div>
+                    <h3 class="text-xl font-semibold mb-2">Analyzed Frame</h3>
+                    <img id="modalImage" src="" alt="Analyzed Frame" class="rounded-lg border w-full">
+                </div>
+                <!-- Modal Details -->
+                <div class="space-y-4">
+                    <p><strong>Timestamp:</strong> <span id="modalTimestamp" class="text-gray-700"></span></p>
+                    <p><strong>Description:</strong> <span id="modalDescription" class="text-gray-700"></span></p>
+                    <div>
+                        <p><strong>Tags:</strong></p>
+                        <div id="modalTags" class="text-gray-700 flex flex-wrap gap-2 mt-2">
+                            <!-- Tags will be injected here -->
+                        </div>
+                    </div>
+                    <div>
+                        <p><strong>Detected Objects:</strong></p>
+                        <ul id="modalObjects" class="list-disc list-inside text-gray-700 pl-4">
+                            <!-- Objects will be injected here -->
                         </ul>
                     </div>
                 </div>
             </div>
         </div>
-
-
     </div>
 
     <script>
+        // --- DOM Elements ---
+        const videoFeed = document.getElementById('videoFeed');
+        const overlayCanvas = document.getElementById('overlayCanvas');
+        const ctx = overlayCanvas.getContext('2d');
+        
         const analyzeButton = document.getElementById('analyzeButton');
-        const statusMessageDiv = document.getElementById('statusMessage');
+        const analyzeSpinner = document.getElementById('analyzeSpinner');
+        const analyzeText = document.getElementById('analyzeText');
+        
+        const localCamButton = document.getElementById('localCamButton');
+        const rtspCamButton = document.getElementById('rtspCamButton');
+        const statusMessage = document.getElementById('statusMessage');
+
+        // Current Analysis Elements
         const descriptionText = document.getElementById('descriptionText');
         const tagsList = document.getElementById('tagsList');
         const objectsList = document.getElementById('objectsList');
-        
-        // History elements
+
+        // History Elements
+        const refreshHistoryBtn = document.getElementById('refreshHistoryBtn');
         const historyList = document.getElementById('historyList');
-        const historyMessage = document.getElementById('historyMessage');
+        const historyLoading = document.getElementById('historyLoading');
+        const historyError = document.getElementById('historyError');
+        let analysisHistoryCache = []; // Cache to hold full history data
+
+        // Modal Elements
         const historyModal = document.getElementById('historyModal');
-        const closeModalButton = document.getElementById('closeModal');
-        const historicalFrame = document.getElementById('historicalFrame');
+        const closeModalBtn = document.getElementById('closeModalBtn');
+        const modalImage = document.getElementById('modalImage');
         const modalTimestamp = document.getElementById('modalTimestamp');
         const modalDescription = document.getElementById('modalDescription');
-        const modalObjectCount = document.getElementById('modalObjectCount');
         const modalTags = document.getElementById('modalTags');
         const modalObjects = document.getElementById('modalObjects');
 
+        // --- Event Listeners ---
+        
+        // Analyze Button
+        analyzeButton.addEventListener('click', handleAnalyzeFrame);
+        
+        // Camera Switch Buttons
+        localCamButton.addEventListener('click', () => switchCameraSource('local'));
+        rtspCamButton.addEventListener('click', () => switchCameraSource('rtsp'));
 
-        function showMessage(message, isError = false) {
-            statusMessageDiv.textContent = message;
-            statusMessageDiv.classList.remove('hidden', 'bg-red-100', 'text-red-700', 'bg-green-100', 'text-green-700');
-            statusMessageDiv.classList.add(isError ? 'bg-red-100' : 'bg-green-100', isError ? 'text-red-700' : 'text-green-700');
+        // History Buttons
+        refreshHistoryBtn.addEventListener('click', loadHistory);
+
+        // Modal Close Buttons
+        closeModalBtn.addEventListener('click', closeModal);
+        historyModal.addEventListener('click', (e) => {
+            if (e.target === historyModal) closeModal();
+        });
+
+        // --- Initialization ---
+        window.addEventListener('load', () => {
+            resizeCanvas();
+            loadHistory();
+        });
+        window.addEventListener('resize', resizeCanvas);
+
+        // --- Functions ---
+
+        function resizeCanvas() {
+            // Make canvas overlay match the video feed's rendered size
+            overlayCanvas.width = videoFeed.clientWidth;
+            overlayCanvas.height = videoFeed.clientHeight;
         }
 
-        function populateAnalysisDetails(data) {
-            descriptionText.textContent = data.description?.captions?.[0]?.text || 'No description available.';
-            tagsList.textContent = data.tags?.map(t => t.name).join(', ') || 'No tags available.';
+        function setAnalyzeButtonState(isLoading, message = 'Analyze Current Frame') {
+            analyzeButton.disabled = isLoading;
+            analyzeText.textContent = message;
+            if (isLoading) {
+                analyzeSpinner.classList.remove('hidden');
+            } else {
+                analyzeSpinner.classList.add('hidden');
+            }
+        }
+
+        function showStatus(message, isError = false) {
+            statusMessage.textContent = message;
+            statusMessage.style.color = isError ? '#EF4444' : '#10B981';
+            if (!isError) {
+                setTimeout(() => statusMessage.textContent = '', 3000);
+            }
+        }
+
+        async function switchCameraSource(source) {
+            showStatus(`Switching to ${source} stream...`);
+            localCamButton.disabled = true;
+            rtspCamButton.disabled = true;
+
+            try {
+                // This is a "fire-and-forget" request to the config file
+                // The camera_manager.py will pick up the change
+                await fetch(`/switch_camera?source=${source}`, { method: 'POST' });
+                showStatus(`Request sent to switch to ${source}. Stream will update shortly.`);
+                videoFeed.src = `/video_feed?t=${new Date().getTime()}`; // Force reload
+            } catch (error) {
+                console.error('Error switching camera:', error);
+                showStatus('Error: Could not send switch request.', true);
+            } finally {
+                localCamButton.disabled = false;
+                rtspCamButton.disabled = false;
+            }
+        }
+
+        async function handleAnalyzeFrame() {
+            setAnalyzeButtonState(true, 'Analyzing...');
+            showStatus('');
+            ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            clearCurrentAnalysisDetails();
+
+            try {
+                const response = await fetch('/analyze_current_frame', { method: 'POST' });
+                
+                if (!response.ok) {
+                    // Try to parse error from server
+                    let errorMsg = `HTTP error! Status: ${response.status}`;
+                    try {
+                        const errData = await response.json();
+                        errorMsg = errData.error || errorMsg;
+                    } catch (e) {
+                        // Response wasn't JSON, maybe HTML error page
+                         const textError = await response.text();
+                         throw new Error(`Analysis API call failed: ${response.status}. Response: ${textError.substring(0, 100)}...`);
+                    }
+                    throw new Error(errorMsg);
+                }
+                
+                const data = await response.json();
+
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                showStatus('Analysis complete!', false);
+                populateCurrentAnalysisDetails(data);
+                drawBoxesOnCanvas(data.objects);
+                loadHistory(); // Refresh history after analysis
+
+            } catch (error) {
+                console.error('Analysis error:', error);
+                let errorText = error.message;
+                // Handle JSON parse errors from 404/405s
+                if (error instanceof SyntaxError && error.message.includes("is not valid JSON")) {
+                    errorText = `Analysis API call failed. Is the server running the correct code? (Received non-JSON response)`;
+                }
+                showStatus(`Error: ${errorText}`, true);
+            } finally {
+                setAnalyzeButtonState(false);
+            }
+        }
+
+        function populateCurrentAnalysisDetails(data) {
+            descriptionText.textContent = data.description_text || 'No description available.';
+            tagsList.textContent = data.tags?.map(t => `${t.name} (${(t.confidence * 100).toFixed(0)}%)`).join(', ') || 'No tags available.';
             
             if (data.objects && data.objects.length > 0) {
                 objectsList.innerHTML = '';
                 data.objects.forEach(obj => {
                     const li = document.createElement('li');
-                    const confidencePercent = obj.confidence * 100;
-                    
-                    // Add color coding based on confidence 
-                    if (confidencePercent > 85) {
-                        li.style.color = '#10B981'; // Green
-                    } else if (confidencePercent > 60) {
-                        li.style.color = '#F59E0B'; // Amber
-                    } else {
-                        li.style.color = '#EF4444'; // Red
-                    }
-
-                    li.textContent = `${obj.object_property} (${Math.round(confidencePercent)}%)`;
+                    li.textContent = `${obj.object_property} (${(obj.confidence * 100).toFixed(0)}%)`;
                     objectsList.appendChild(li);
                 });
             } else {
-                objectsList.innerHTML = '<li class="text-gray-500">No objects detected.</li>';
+                objectsList.innerHTML = '<li>No objects detected.</li>';
             }
-            
-            // NEW: Reload history after a successful analysis and save
-            loadHistory();
+        }
+        
+        function clearCurrentAnalysisDetails() {
+            descriptionText.textContent = '...';
+            tagsList.textContent = '...';
+            objectsList.innerHTML = '<li>...</li>';
         }
 
-        // --- NEW HISTORY FUNCTIONS ---
+        function drawBoxesOnCanvas(objects) {
+            ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            
+            // Get scaling factors
+            const scaleX = overlayCanvas.width / 1280; // 1280 is the original frame width
+            const scaleY = overlayCanvas.height / 720; // 720 is the original frame height
+
+            ctx.strokeStyle = '#00BFFF'; // Deep Sky Blue
+            ctx.lineWidth = 2;
+            ctx.font = '16px Arial';
+            ctx.fillStyle = '#00BFFF';
+
+            objects.forEach(obj => {
+                const box = obj.rectangle;
+                const x = box.x * scaleX;
+                const y = box.y * scaleY;
+                const w = box.w * scaleX;
+                const h = box.h * scaleY;
+                
+                ctx.strokeRect(x, y, w, h);
+                
+                const label = `${obj.object_property} (${(obj.confidence * 100).toFixed(0)}%)`;
+                ctx.fillText(label, x, y > 20 ? y - 5 : y + h + 15);
+            });
+        }
+
+        // --- History Functions ---
 
         async function loadHistory() {
-            historyList.innerHTML = '<li class="text-gray-500 text-sm italic">Loading history...</li>';
-            historyMessage.classList.add('hidden');
+            historyLoading.classList.remove('hidden');
+            historyError.classList.add('hidden');
+            historyList.innerHTML = ''; // Clear old list
+            historyList.appendChild(historyLoading);
 
             try {
-                const response = await fetch('/analysis_history');
-                const result = await response.json();
-
-                if (result.status !== 'success') {
-                    historyList.innerHTML = `<li class="text-red-500 text-sm">Error: ${result.message}</li>`;
-                    return;
+                const response = await fetch('/get_analysis_history');
+                if (!response.ok) {
+                    const errData = await response.json();
+                    throw new Error(errData.error || `HTTP Error ${response.status}`);
                 }
                 
-                const history = result.history;
-                if (history.length === 0) {
-                    historyList.innerHTML = '<li class="text-gray-500 text-sm italic">No past analyses found.</li>';
-                    return;
-                }
-
-                historyList.innerHTML = ''; // Clear loading message
-                history.forEach(record => {
-                    const li = document.createElement('li');
-                    li.className = 'history-item p-2 rounded-md border border-gray-200 text-sm';
-                    li.dataset.timestamp = record.timestamp;
-                    
-                    // Format timestamp for display
-                    const date = new Date(record.timestamp);
-                    const timeStr = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-                    const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-
-                    li.innerHTML = `
-                        <div class="font-semibold text-gray-800">${timeStr} on ${dateStr}</div>
-                        <div class="text-gray-600 italic truncate">${record.description}</div>
-                        <div class="text-xs text-indigo-500">${record.object_count} objects detected</div>
-                    `;
-                    li.addEventListener('click', () => displayHistoricalFrame(record.timestamp));
-                    historyList.appendChild(li);
-                });
+                const data = await response.json();
+                analysisHistoryCache = data; // Store full data in cache
+                renderHistoryList(data);
 
             } catch (error) {
                 console.error('Error loading history:', error);
-                historyList.innerHTML = `<li class="text-red-500 text-sm">Failed to connect to history service.</li>`;
-            }
-        }
-        
-        async function displayHistoricalFrame(timestamp) {
-            // Show loading state in the modal
-            historicalFrame.src = 'https://placehold.co/400x300/e5e7eb/9ca3af?text=Loading+Image...';
-            
-            try {
-                // 1. Get the Base64 frame and full metadata
-                const frameResponse = await fetch(`/analysis_frame/${timestamp}`);
-                const frameResult = await frameResponse.json();
-                
-                if (frameResult.status !== 'success') {
-                    throw new Error(frameResult.message || "Failed to fetch frame data.");
+                 let errorText = error.message;
+                if (error instanceof SyntaxError && error.message.includes("is not valid JSON")) {
+                    errorText = `History API call failed. Is the server running? (Received non-JSON response)`;
                 }
-                
-                const data = frameResult.data;
-                
-                // 2. Set the modal content
-                const base64Image = `data:image/jpeg;base64,${data.frame_b64}`;
-                historicalFrame.src = base64Image;
-                
-                const date = new Date(timestamp);
-                
-                modalTimestamp.textContent = date.toLocaleString();
-                modalDescription.textContent = data.description || 'N/A';
-                modalObjectCount.textContent = data.object_count;
-                
-                // Display Tags
-                modalTags.textContent = data.tags.map(t => t.name).join(', ') || 'No tags found.';
-                
-                // Display Objects
-                modalObjects.innerHTML = '';
-                if (data.objects && data.objects.length > 0) {
-                    data.objects.forEach(obj => {
-                        const li = document.createElement('li');
-                        li.textContent = `${obj.object_property} (${Math.round(obj.confidence * 100)}%)`;
-                        modalObjects.appendChild(li);
-                    });
-                } else {
-                    modalObjects.innerHTML = '<li>None</li>';
-                }
-
-                // 3. Show the modal
-                historyModal.classList.remove('opacity-0', 'pointer-events-none');
-                historyModal.querySelector('div').classList.remove('translate-y-4');
-
-
-            } catch (error) {
-                console.error('Error displaying historical frame:', error);
-                showMessage(`Error loading history: ${error.message}`, true);
-            }
-        }
-
-
-        // --- EVENT LISTENERS ---
-
-        analyzeButton.addEventListener('click', async () => {
-            showMessage("Analysis in progress...", false);
-            analyzeButton.disabled = true;
-            
-            // Clear previous results
-            descriptionText.textContent = 'Analyzing...';
-            tagsList.textContent = '...';
-            objectsList.innerHTML = '<li class="text-gray-500">Analyzing...</li>';
-
-            try {
-                const response = await fetch('/analyze_current_frame');
-                const result = await response.json();
-
-                if (result.status === 'success') {
-                    populateAnalysisDetails(result.analysis_data);
-                    showMessage("Analysis successful and frame saved!", false);
-                } else {
-                    showMessage(`Error: ${result.message}`, true);
-                }
-            } catch (error) {
-                console.error('Analysis API call failed:', error);
-                showMessage('An unexpected error occurred during analysis.', true);
+                historyError.textContent = `Error: ${errorText}`;
+                historyError.classList.remove('hidden');
             } finally {
-                analyzeButton.disabled = false;
+                historyLoading.classList.add('hidden');
             }
-        });
+        }
 
-        // Close modal listener
-        closeModalButton.addEventListener('click', () => {
+        function renderHistoryList(historyData) {
+            historyList.innerHTML = ''; // Clear "Loading..."
+            if (historyData.length === 0) {
+                historyList.innerHTML = '<p class="text-gray-500">No history found.</p>';
+                return;
+            }
+
+            historyData.forEach((item, index) => {
+                const date = new Date(item.timestamp);
+                const li = document.createElement('li');
+                li.className = 'p-3 rounded-lg border hover:bg-gray-50 cursor-pointer flex justify-between items-center';
+                li.innerHTML = `
+                    <div>
+                        <span class="font-semibold">${date.toLocaleString()}</span>
+                        <span class="block text-sm text-gray-600">${item.description || 'No description'}</span>
+                    </div>
+                    <span class="text-sm font-medium text-blue-600">${item.object_count} Object(s)</span>
+                `;
+                li.addEventListener('click', () => openModal(index));
+                historyList.appendChild(li);
+            });
+        }
+
+        function openModal(index) {
+            const item = analysisHistoryCache[index];
+            if (!item) return;
+            
+            modalImage.src = `data:image/jpeg;base64,${item.frame_b64}`;
+            modalTimestamp.textContent = new Date(item.timestamp).toLocaleString();
+            modalDescription.textContent = item.description || 'N/A';
+            
+            // Populate Tags
+            modalTags.innerHTML = '';
+            const tags = JSON.parse(item.tags_json || '[]');
+            if (tags.length > 0) {
+                tags.forEach(tag => {
+                    const tagEl = document.createElement('span');
+                    tagEl.className = 'bg-blue-100 text-blue-800 text-xs font-medium px-2.5 py-0.5 rounded';
+                    tagEl.textContent = `${tag.name} (${(tag.confidence * 100).toFixed(0)}%)`;
+                    modalTags.appendChild(tagEl);
+                });
+            } else {
+                modalTags.innerHTML = '<span class="text-gray-500">No tags.</span>';
+            }
+            
+            // Populate Objects
+            modalObjects.innerHTML = '';
+            const objects = JSON.parse(item.objects_json || '[]');
+            if (objects.length > 0) {
+                objects.forEach(obj => {
+                    const li = document.createElement('li');
+                    li.textContent = `${obj.object_property} (${(obj.confidence * 100).toFixed(0)}%)`;
+                    modalObjects.appendChild(li);
+                });
+            } else {
+                modalObjects.innerHTML = '<li>No objects detected.</li>';
+            }
+
+            // Show modal
+            historyModal.classList.remove('opacity-0', 'pointer-events-none');
+            historyModal.querySelector('.modal-content').classList.remove('scale-95', 'opacity-0');
+        }
+
+        function closeModal() {
             historyModal.classList.add('opacity-0', 'pointer-events-none');
-            historyModal.querySelector('div').classList.add('translate-y-4');
-        });
-
-        // Close modal when clicking outside
-        historyModal.addEventListener('click', (e) => {
-            if (e.target === historyModal) {
-                closeModalButton.click();
-            }
-        });
-        
-        // Initial load of history when the page loads
-        document.addEventListener('DOMContentLoaded', loadHistory);
+            historyModal.querySelector('.modal-content').classList.add('scale-95', 'opacity-0');
+        }
 
     </script>
 </body>
