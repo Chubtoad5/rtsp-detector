@@ -3,7 +3,7 @@
 # This script creates a new, clean directory for your project.
 # Run it with: bash create_rtsp_k8s_project.sh
 
-PROJECT_DIR="rtsp-k8s-project"
+PROJECT_DIR="rtsp-k8s-project-v2"
 mkdir -p $PROJECT_DIR/templates
 mkdir -p $PROJECT_DIR/static
 
@@ -345,7 +345,8 @@ import cv2
 import numpy as np
 import base64
 import io
-from urllib.parse import urlparse, urlunparse # Added for URL sanitizing
+from urllib.parse import urlparse, urlunparse
+from datetime import datetime, timedelta # Added for history modal fix
 
 from flask import Flask, render_template, Response, jsonify, request
 from azure.cognitiveservices.vision.computervision import ComputerVisionClient
@@ -353,8 +354,7 @@ from msrest.authentication import CognitiveServicesCredentials
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
-from datetime import datetime
-import datetime as dt # Use a distinct alias for timedelta
+import datetime as dt
 
 # =============================================================================
 # CONFIGURATION
@@ -624,7 +624,7 @@ def get_analysis_history():
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # --- FIX for Field Limit Error ---
+        # --- FIX for Field Limit Error (as before) ---
         # 1. Query for all STRING fields *EXCEPT* the large frame_b64 field
         query_strings = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
@@ -692,15 +692,22 @@ def get_historical_record(timestamp):
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # The timestamp is received URL-decoded from Flask
-        # e.g., "2025-11-02T05:45:00.123Z"
+        # --- FIX #1: Timestamp lookup robustness ---
+        # 1. Parse the incoming ISO 8601 timestamp string into a Python datetime object.
+        # This handles the complexity of the timezone offset (+00:00).
+        dt_obj = datetime.fromisoformat(timestamp)
         
-        # We query for a very narrow time window
+        # 2. Define a small time range (e.g., +/- 1 second) around the timestamp.
+        # This handles small precision differences between the query time and the stored time.
+        start_time = (dt_obj - timedelta(seconds=1)).isoformat()
+        end_time = (dt_obj + timedelta(seconds=1)).isoformat()
+
+        # 3. Query the range and filter by measurement
         query = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
-          |> range(start: 0)
+          |> range(start: time(v: "{start_time}"), stop: time(v: "{end_time}"))
           |> filter(fn: (r) => r._measurement == "analysis_record")
-          |> filter(fn: (r) => r._time == time(v: "{timestamp}"))
+          |> filter(fn: (r) => r._time == time(v: "{timestamp}")) # Added for stricter filter
           |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
           |> limit(n: 1)
         '''
@@ -716,7 +723,8 @@ def get_historical_record(timestamp):
         
         # We only need the fields we're going to display
         historical_record = {
-            'timestamp': record_data.get('_time', '').isoformat(),
+            # Use the record's time for the timestamp
+            'timestamp': record_data.get('_time', '').isoformat(), 
             'description': record_data.get('description', ''),
             'tags_json': record_data.get('tags_json', '[]'),
             'objects_json': record_data.get('objects_json', '[]'),
@@ -726,6 +734,9 @@ def get_historical_record(timestamp):
         
         return jsonify(historical_record)
 
+    except ValueError:
+        logger.error(f"Invalid timestamp format received: {timestamp}")
+        return jsonify({'error': 'Invalid timestamp format provided.'}), 400
     except Exception as e:
         logger.error(f"Failed to query InfluxDB for specific frame: {e} (Timestamp: {timestamp})")
         return jsonify({'error': f"Failed to retrieve frame: {str(e)}"}), 500
@@ -763,7 +774,6 @@ SHARED_BUFFER_SIZE = FRAME_HEIGHT * FRAME_WIDTH * FRAME_CHANNELS
 
 # --- Environment Variables ---
 RTSP_STREAM_URL = os.environ.get("RTSP_STREAM_URL")
-# CAMERA_SOURCE and CONFIG_FILE_PATH are no longer needed
 
 # Set OpenCV options for FFMPEG to be more resilient
 os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp|timeout;5000000'
@@ -787,8 +797,6 @@ def cleanup(signum, frame):
     logger.info("Shutdown complete.")
     sys.exit(0)
 
-# get_camera_source() function is no longer needed
-
 def run_camera():
     """Main camera loop with robust reconnection."""
     global shm, camera
@@ -798,13 +806,13 @@ def run_camera():
     signal.signal(signal.SIGINT, cleanup)
 
     try:
-        # Create the shared memory block
-        shm = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHARED_BUFFER_SIZE)
-        logger.info(f"Shared memory block '{SHM_NAME}' created.")
-    except FileExistsError:
-        # If it already exists, just connect to it
-        shm = shared_memory.SharedMemory(name=SHM_NAME, create=False, size=SHARED_BUFFER_SIZE)
-        logger.info(f"Shared memory block '{SHM_NAME}' already exists, connecting.")
+        # Create or connect to the shared memory block
+        try:
+            shm = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHARED_BUFFER_SIZE)
+            logger.info(f"Shared memory block '{SHM_NAME}' created.")
+        except FileExistsError:
+            shm = shared_memory.SharedMemory(name=SHM_NAME, create=False, size=SHARED_BUFFER_SIZE)
+            logger.info(f"Shared memory block '{SHM_NAME}' already exists, connecting.")
     
     # Create a NumPy array backed by the shared memory buffer
     shared_frame_array = np.ndarray((FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS), dtype=np.uint8, buffer=shm.buf)
@@ -820,7 +828,16 @@ def run_camera():
             if not camera or not camera.isOpened():
                 raise IOError(f"Failed to open camera for source: {camera_path}")
             
-            logger.info(f"Camera opened successfully ({camera_path}). Starting frame capture.")
+            # --- FIX #2: Latency Reduction ---
+            # 1. Set buffer size to 1 frame to minimize buffering
+            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            # 2. Read and discard initial frames to clear the stream buffer (fast grab)
+            # This is essential for low-latency RTSP feeds
+            for _ in range(5): 
+                camera.grab() 
+
+            logger.info(f"Camera opened successfully and buffer cleared. Starting frame capture.")
 
             while True:
                 ret, frame = camera.read()
@@ -1138,7 +1155,7 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 drawBoxesOnCanvas(data.objects);
                 loadHistory(); // Refresh history after analysis
 
-                // **NEW**: Clear boxes after 3 seconds
+                // **FIX #2**: Clear boxes after 3 seconds
                 boxClearTimer = setTimeout(() => {
                     ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
                     boxClearTimer = null;
@@ -1179,11 +1196,14 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
         }
 
         function drawBoxesOnCanvas(objects) {
+            // Resize canvas before drawing to ensure correct dimensions
+            resizeCanvas(); 
+
             ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
             
-            // Get scaling factors
-            const scaleX = overlayCanvas.width / 1280; // 1280 is the original frame width
-            const scaleY = overlayCanvas.height / 720; // 720 is the original frame height
+            // Get scaling factors (1280x720 is the known server frame size)
+            const scaleX = overlayCanvas.width / 1280; 
+            const scaleY = overlayCanvas.height / 720; 
 
             ctx.strokeStyle = '#00BFFF'; // Deep Sky Blue
             ctx.lineWidth = 2;
@@ -1200,7 +1220,8 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 ctx.strokeRect(x, y, w, h);
                 
                 const label = `${obj.object_property} (${(obj.confidence * 100).toFixed(0)}%)`;
-                ctx.fillText(label, x, y > 20 ? y - 5 : y + h + 15);
+                // Position text slightly above the box
+                ctx.fillText(label, x, y > 20 ? y - 5 : y + h + 15); 
             });
         }
 
@@ -1247,7 +1268,7 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 return;
             }
 
-            historyData.forEach((item, index) => {
+            historyData.forEach((item) => {
                 const date = new Date(item.timestamp);
                 const li = document.createElement('li');
                 li.className = 'p-3 rounded-lg border hover:bg-gray-50 cursor-pointer flex justify-between items-center';
@@ -1274,14 +1295,19 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
             
             try {
                 // 2. Fetch the full record from the new endpoint
-                // **NEW**: Use encodeURIComponent to safely pass the timestamp
+                // **FIX #1**: Use encodeURIComponent to safely pass the timestamp string 
+                // containing the '+' offset to the backend.
                 const response = await fetch(`/get_historical_record/${encodeURIComponent(timestamp)}`);
+                
                 if (!response.ok) {
                     let errorMsg = `HTTP Error ${response.status}`;
                     try {
                         const errData = await response.json();
                         errorMsg = errData.error || errorMsg;
-                    } catch(e) { /* response wasn't json */ }
+                    } catch(e) { 
+                        const textError = await response.text();
+                        throw new Error(`Server returned: ${response.status}. Response: ${textError.substring(0, 100)}...`);
+                    }
                     throw new Error(errorMsg);
                 }
                 

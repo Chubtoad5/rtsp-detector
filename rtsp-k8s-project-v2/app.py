@@ -7,7 +7,8 @@ import cv2
 import numpy as np
 import base64
 import io
-from urllib.parse import urlparse, urlunparse # Added for URL sanitizing
+from urllib.parse import urlparse, urlunparse
+from datetime import datetime, timedelta # Added for history modal fix
 
 from flask import Flask, render_template, Response, jsonify, request
 from azure.cognitiveservices.vision.computervision import ComputerVisionClient
@@ -15,8 +16,7 @@ from msrest.authentication import CognitiveServicesCredentials
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
-from datetime import datetime
-import datetime as dt # Use a distinct alias for timedelta
+import datetime as dt
 
 # =============================================================================
 # CONFIGURATION
@@ -286,7 +286,7 @@ def get_analysis_history():
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # --- FIX for Field Limit Error ---
+        # --- FIX for Field Limit Error (as before) ---
         # 1. Query for all STRING fields *EXCEPT* the large frame_b64 field
         query_strings = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
@@ -354,15 +354,22 @@ def get_historical_record(timestamp):
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # The timestamp is received URL-decoded from Flask
-        # e.g., "2025-11-02T05:45:00.123Z"
+        # --- FIX #1: Timestamp lookup robustness ---
+        # 1. Parse the incoming ISO 8601 timestamp string into a Python datetime object.
+        # This handles the complexity of the timezone offset (+00:00).
+        dt_obj = datetime.fromisoformat(timestamp)
         
-        # We query for a very narrow time window
+        # 2. Define a small time range (e.g., +/- 1 second) around the timestamp.
+        # This handles small precision differences between the query time and the stored time.
+        start_time = (dt_obj - timedelta(seconds=1)).isoformat()
+        end_time = (dt_obj + timedelta(seconds=1)).isoformat()
+
+        # 3. Query the range and filter by measurement
         query = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
-          |> range(start: 0)
+          |> range(start: time(v: "{start_time}"), stop: time(v: "{end_time}"))
           |> filter(fn: (r) => r._measurement == "analysis_record")
-          |> filter(fn: (r) => r._time == time(v: "{timestamp}"))
+          |> filter(fn: (r) => r._time == time(v: "{timestamp}")) # Added for stricter filter
           |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
           |> limit(n: 1)
         '''
@@ -378,7 +385,8 @@ def get_historical_record(timestamp):
         
         # We only need the fields we're going to display
         historical_record = {
-            'timestamp': record_data.get('_time', '').isoformat(),
+            # Use the record's time for the timestamp
+            'timestamp': record_data.get('_time', '').isoformat(), 
             'description': record_data.get('description', ''),
             'tags_json': record_data.get('tags_json', '[]'),
             'objects_json': record_data.get('objects_json', '[]'),
@@ -388,6 +396,9 @@ def get_historical_record(timestamp):
         
         return jsonify(historical_record)
 
+    except ValueError:
+        logger.error(f"Invalid timestamp format received: {timestamp}")
+        return jsonify({'error': 'Invalid timestamp format provided.'}), 400
     except Exception as e:
         logger.error(f"Failed to query InfluxDB for specific frame: {e} (Timestamp: {timestamp})")
         return jsonify({'error': f"Failed to retrieve frame: {str(e)}"}), 500

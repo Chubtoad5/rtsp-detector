@@ -22,7 +22,6 @@ SHARED_BUFFER_SIZE = FRAME_HEIGHT * FRAME_WIDTH * FRAME_CHANNELS
 
 # --- Environment Variables ---
 RTSP_STREAM_URL = os.environ.get("RTSP_STREAM_URL")
-# CAMERA_SOURCE and CONFIG_FILE_PATH are no longer needed
 
 # Set OpenCV options for FFMPEG to be more resilient
 os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp|timeout;5000000'
@@ -46,8 +45,6 @@ def cleanup(signum, frame):
     logger.info("Shutdown complete.")
     sys.exit(0)
 
-# get_camera_source() function is no longer needed
-
 def run_camera():
     """Main camera loop with robust reconnection."""
     global shm, camera
@@ -57,13 +54,13 @@ def run_camera():
     signal.signal(signal.SIGINT, cleanup)
 
     try:
-        # Create the shared memory block
-        shm = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHARED_BUFFER_SIZE)
-        logger.info(f"Shared memory block '{SHM_NAME}' created.")
-    except FileExistsError:
-        # If it already exists, just connect to it
-        shm = shared_memory.SharedMemory(name=SHM_NAME, create=False, size=SHARED_BUFFER_SIZE)
-        logger.info(f"Shared memory block '{SHM_NAME}' already exists, connecting.")
+        # Create or connect to the shared memory block
+        try:
+            shm = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHARED_BUFFER_SIZE)
+            logger.info(f"Shared memory block '{SHM_NAME}' created.")
+        except FileExistsError:
+            shm = shared_memory.SharedMemory(name=SHM_NAME, create=False, size=SHARED_BUFFER_SIZE)
+            logger.info(f"Shared memory block '{SHM_NAME}' already exists, connecting.")
     
     # Create a NumPy array backed by the shared memory buffer
     shared_frame_array = np.ndarray((FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS), dtype=np.uint8, buffer=shm.buf)
@@ -79,7 +76,16 @@ def run_camera():
             if not camera or not camera.isOpened():
                 raise IOError(f"Failed to open camera for source: {camera_path}")
             
-            logger.info(f"Camera opened successfully ({camera_path}). Starting frame capture.")
+            # --- FIX #2: Latency Reduction ---
+            # 1. Set buffer size to 1 frame to minimize buffering
+            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            # 2. Read and discard initial frames to clear the stream buffer (fast grab)
+            # This is essential for low-latency RTSP feeds
+            for _ in range(5): 
+                camera.grab() 
+
+            logger.info(f"Camera opened successfully and buffer cleared. Starting frame capture.")
 
             while True:
                 ret, frame = camera.read()

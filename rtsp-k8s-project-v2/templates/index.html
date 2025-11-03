@@ -281,7 +281,7 @@
                 drawBoxesOnCanvas(data.objects);
                 loadHistory(); // Refresh history after analysis
 
-                // **NEW**: Clear boxes after 3 seconds
+                // **FIX #2**: Clear boxes after 3 seconds
                 boxClearTimer = setTimeout(() => {
                     ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
                     boxClearTimer = null;
@@ -322,11 +322,14 @@
         }
 
         function drawBoxesOnCanvas(objects) {
+            // Resize canvas before drawing to ensure correct dimensions
+            resizeCanvas(); 
+
             ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
             
-            // Get scaling factors
-            const scaleX = overlayCanvas.width / 1280; // 1280 is the original frame width
-            const scaleY = overlayCanvas.height / 720; // 720 is the original frame height
+            // Get scaling factors (1280x720 is the known server frame size)
+            const scaleX = overlayCanvas.width / 1280; 
+            const scaleY = overlayCanvas.height / 720; 
 
             ctx.strokeStyle = '#00BFFF'; // Deep Sky Blue
             ctx.lineWidth = 2;
@@ -343,7 +346,8 @@
                 ctx.strokeRect(x, y, w, h);
                 
                 const label = `${obj.object_property} (${(obj.confidence * 100).toFixed(0)}%)`;
-                ctx.fillText(label, x, y > 20 ? y - 5 : y + h + 15);
+                // Position text slightly above the box
+                ctx.fillText(label, x, y > 20 ? y - 5 : y + h + 15); 
             });
         }
 
@@ -390,7 +394,7 @@
                 return;
             }
 
-            historyData.forEach((item, index) => {
+            historyData.forEach((item) => {
                 const date = new Date(item.timestamp);
                 const li = document.createElement('li');
                 li.className = 'p-3 rounded-lg border hover:bg-gray-50 cursor-pointer flex justify-between items-center';
@@ -417,14 +421,19 @@
             
             try {
                 // 2. Fetch the full record from the new endpoint
-                // **NEW**: Use encodeURIComponent to safely pass the timestamp
+                // **FIX #1**: Use encodeURIComponent to safely pass the timestamp string 
+                // containing the '+' offset to the backend.
                 const response = await fetch(`/get_historical_record/${encodeURIComponent(timestamp)}`);
+                
                 if (!response.ok) {
                     let errorMsg = `HTTP Error ${response.status}`;
                     try {
                         const errData = await response.json();
                         errorMsg = errData.error || errorMsg;
-                    } catch(e) { /* response wasn't json */ }
+                    } catch(e) { 
+                        const textError = await response.text();
+                        throw new Error(`Server returned: ${response.status}. Response: ${textError.substring(0, 100)}...`);
+                    }
                     throw new Error(errorMsg);
                 }
                 
