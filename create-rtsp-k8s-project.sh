@@ -606,12 +606,14 @@ def get_analysis_history():
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # --- FIX for Schema Collision Error ---
-        # 1. Query for all STRING fields first.
+        # --- FIX for Field Limit Error ---
+        # 1. Query for all STRING fields *EXCEPT* the large frame_b64 field
         query_strings = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
           |> range(start: -30d) 
-          |> filter(fn: (r) => r._measurement == "analysis_record" and r._field != "object_count")
+          |> filter(fn: (r) => r._measurement == "analysis_record" and 
+                             r._field != "object_count" and 
+                             r._field != "frame_b64")
           |> sort(columns: ["_time"], desc: true)
           |> limit(n: 50) 
         '''
@@ -650,10 +652,10 @@ def get_analysis_history():
         # Convert dict to a list
         history_list = list(time_to_data.values())
         
-        # Filter out any incomplete records (e.g., if one query missed a timestamp)
+        # Filter out any incomplete records
         history_list = [
             data for data in history_list
-            if 'description' in data and 'frame_b64' in data and 'object_count' in data
+            if 'description' in data and 'object_count' in data
         ]
         
         # Sort by timestamp descending
@@ -665,13 +667,50 @@ def get_analysis_history():
         logger.error(f"Failed to query InfluxDB for history: {e}")
         return jsonify({'error': f"Failed to retrieve history: {str(e)}"}), 500
 
-@app.route('/get_historical_frame/<timestamp>', methods=['GET'])
-def get_historical_frame(timestamp):
-    """Retrieves the full data record for a specific timestamp."""
-    # This route is no longer needed, as /get_analysis_history now sends
-    # all data needed for the modal, including the frame_b64.
-    # We will leave it here but it's unused by the new index.html.
-    return jsonify({'error': 'This endpoint is deprecated.'}), 404
+@app.route('/get_historical_record/<timestamp>', methods=['GET'])
+def get_historical_record(timestamp):
+    """Retrieves the full data record (including frame) for a specific timestamp."""
+    if not query_api:
+        return jsonify({'error': 'InfluxDB client is not ready.'}), 503
+
+    try:
+        # Convert JS ISO string to RFC3339 format for Flux
+        # 2025-11-02T22:30:00.123Z -> 2025-11-02T22:30:00.123Z
+        # This format is usually fine, but we'll be explicit
+        
+        # We query for a very narrow time window
+        query = f'''
+        from(bucket: "{INFLUXDB_BUCKET}")
+          |> range(start: 0)
+          |> filter(fn: (r) => r._measurement == "analysis_record")
+          |> filter(fn: (r) => r._time == time(v: "{timestamp}"))
+          |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+          |> limit(n: 1)
+        '''
+        
+        tables = query_api.query(query, org=INFLUXDB_ORG)
+        
+        if not tables or not tables[0].records:
+            return jsonify({'error': 'No record found for that timestamp.'}), 404
+
+        # Reconstruct the single record from the pivoted table
+        record_data = tables[0].records[0].values
+        
+        # We only need the fields we're going to display
+        historical_record = {
+            'timestamp': record_data.get('_time', '').isoformat(),
+            'description': record_data.get('description', ''),
+            'tags_json': record_data.get('tags_json', '[]'),
+            'objects_json': record_data.get('objects_json', '[]'),
+            'object_count': record_data.get('object_count', 0),
+            'frame_b64': record_data.get('frame_b64', '')
+        }
+        
+        return jsonify(historical_record)
+
+    except Exception as e:
+        logger.error(f"Failed to query InfluxDB for specific frame: {e}")
+        return jsonify({'error': f"Failed to retrieve frame: {str(e)}"}), 500
 
 if __name__ == '__main__':
     # This is for local development only
@@ -857,6 +896,13 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
             transition: all 0.25s ease;
             max-height: 90vh;
         }
+        .spinner {
+            border-top-color: transparent;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body class="bg-gray-100 text-gray-900">
@@ -929,7 +975,19 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 <h2 class="text-2xl font-semibold">Historical Analysis</h2>
                 <button id="closeModalBtn" class="text-gray-500 hover:text-gray-800 text-3xl">&times;</button>
             </div>
-            <div class="p-6 grid grid-cols-1 md:grid-cols-2 gap-6">
+            
+            <!-- Modal Body -->
+            <div id="modalLoading" class="hidden p-6 text-center">
+                <div class="w-12 h-12 border-4 border-blue-500 spinner rounded-full inline-block"></div>
+                <p class="text-lg font-medium mt-4">Loading full record...</p>
+            </div>
+
+            <div id="modalError" class="hidden p-6 text-center">
+                <p class="text-lg font-medium text-red-600">Failed to load record.</p>
+                <p id="modalErrorDetails" class="text-gray-700"></p>
+            </div>
+
+            <div id="modalDetails" class="p-6 grid grid-cols-1 md:grid-cols-2 gap-6">
                 <!-- Modal Image -->
                 <div>
                     <h3 class="text-xl font-semibold mb-2">Analyzed Frame</h3>
@@ -980,11 +1038,16 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
         const historyList = document.getElementById('historyList');
         const historyLoading = document.getElementById('historyLoading');
         const historyError = document.getElementById('historyError');
-        let analysisHistoryCache = []; // Cache to hold full history data
+        let analysisHistoryCache = []; // Cache to hold METADATA only
 
         // Modal Elements
         const historyModal = document.getElementById('historyModal');
         const closeModalBtn = document.getElementById('closeModalBtn');
+        const modalLoading = document.getElementById('modalLoading');
+        const modalError = document.getElementById('modalError');
+        const modalErrorDetails = document.getElementById('modalErrorDetails');
+        const modalDetails = document.getElementById('modalDetails');
+        
         const modalImage = document.getElementById('modalImage');
         const modalTimestamp = document.getElementById('modalTimestamp');
         const modalDescription = document.getElementById('modalDescription');
@@ -1050,9 +1113,12 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
             try {
                 // This is a "fire-and-forget" request to the config file
                 // The camera_manager.py will pick up the change
-                await fetch(`/switch_camera?source=${source}`, { method: 'POST' });
-                showStatus(`Request sent to switch to ${source}. Stream will update shortly.`);
-                videoFeed.src = `/video_feed?t=${new Date().getTime()}`; // Force reload
+                // We've removed the /switch_camera endpoint, but if it were
+                // re-added, it would write to /app/config/camera_source.txt
+                // For now, this button won't do anything.
+                // await fetch(`/switch_camera?source=${source}`, { method: 'POST' });
+                showStatus(`Camera switching is configured by environment variables.`, true);
+                // videoFeed.src = `/video_feed?t=${new Date().getTime()}`; // Force reload
             } catch (error) {
                 console.error('Error switching camera:', error);
                 showStatus('Error: Could not send switch request.', true);
@@ -1078,7 +1144,6 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                         const errData = await response.json();
                         errorMsg = errData.error || errorMsg;
                     } catch (e) {
-                        // Response wasn't JSON, maybe HTML error page
                          const textError = await response.text();
                          throw new Error(`Analysis API call failed: ${response.status}. Response: ${textError.substring(0, 100)}...`);
                     }
@@ -1099,7 +1164,6 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
             } catch (error) {
                 console.error('Analysis error:', error);
                 let errorText = error.message;
-                // Handle JSON parse errors from 404/405s
                 if (error instanceof SyntaxError && error.message.includes("is not valid JSON")) {
                     errorText = `Analysis API call failed. Is the server running the correct code? (Received non-JSON response)`;
                 }
@@ -1168,12 +1232,16 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
             try {
                 const response = await fetch('/get_analysis_history');
                 if (!response.ok) {
-                    const errData = await response.json();
-                    throw new Error(errData.error || `HTTP Error ${response.status}`);
+                    let errorMsg = `HTTP Error ${response.status}`;
+                    try {
+                        const errData = await response.json();
+                        errorMsg = errData.error || errorMsg;
+                    } catch(e) { /* response wasn't json */ }
+                    throw new Error(errorMsg);
                 }
                 
                 const data = await response.json();
-                analysisHistoryCache = data; // Store full data in cache
+                analysisHistoryCache = data; // Store METADATA in cache
                 renderHistoryList(data);
 
             } catch (error) {
@@ -1207,49 +1275,76 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                     </div>
                     <span class="text-sm font-medium text-blue-600">${item.object_count} Object(s)</span>
                 `;
-                li.addEventListener('click', () => openModal(index));
+                // Pass the unique timestamp to openModal
+                li.addEventListener('click', () => openModal(item.timestamp));
                 historyList.appendChild(li);
             });
         }
 
-        function openModal(index) {
-            const item = analysisHistoryCache[index];
-            if (!item) return;
-            
-            modalImage.src = `data:image/jpeg;base64,${item.frame_b64}`;
-            modalTimestamp.textContent = new Date(item.timestamp).toLocaleString();
-            modalDescription.textContent = item.description || 'N/A';
-            
-            // Populate Tags
-            modalTags.innerHTML = '';
-            const tags = JSON.parse(item.tags_json || '[]');
-            if (tags.length > 0) {
-                tags.forEach(tag => {
-                    const tagEl = document.createElement('span');
-                    tagEl.className = 'bg-blue-100 text-blue-800 text-xs font-medium px-2.5 py-0.5 rounded';
-                    tagEl.textContent = `${tag.name} (${(tag.confidence * 100).toFixed(0)}%)`;
-                    modalTags.appendChild(tagEl);
-                });
-            } else {
-                modalTags.innerHTML = '<span class="text-gray-500">No tags.</span>';
-            }
-            
-            // Populate Objects
-            modalObjects.innerHTML = '';
-            const objects = JSON.parse(item.objects_json || '[]');
-            if (objects.length > 0) {
-                objects.forEach(obj => {
-                    const li = document.createElement('li');
-                    li.textContent = `${obj.object_property} (${(obj.confidence * 100).toFixed(0)}%)`;
-                    modalObjects.appendChild(li);
-                });
-            } else {
-                modalObjects.innerHTML = '<li>No objects detected.</li>';
-            }
-
-            // Show modal
+        async function openModal(timestamp) {
+            // 1. Show modal in loading state
             historyModal.classList.remove('opacity-0', 'pointer-events-none');
             historyModal.querySelector('.modal-content').classList.remove('scale-95', 'opacity-0');
+            modalDetails.classList.add('hidden');
+            modalError.classList.add('hidden');
+            modalLoading.classList.remove('hidden');
+            
+            try {
+                // 2. Fetch the full record from the new endpoint
+                const response = await fetch(`/get_historical_record/${timestamp}`);
+                if (!response.ok) {
+                    let errorMsg = `HTTP Error ${response.status}`;
+                    try {
+                        const errData = await response.json();
+                        errorMsg = errData.error || errorMsg;
+                    } catch(e) { /* response wasn't json */ }
+                    throw new Error(errorMsg);
+                }
+                
+                const item = await response.json();
+
+                // 3. Populate modal with full data
+                modalImage.src = `data:image/jpeg;base64,${item.frame_b64}`;
+                modalTimestamp.textContent = new Date(item.timestamp).toLocaleString();
+                modalDescription.textContent = item.description || 'N/A';
+                
+                // Populate Tags
+                modalTags.innerHTML = '';
+                const tags = JSON.parse(item.tags_json || '[]');
+                if (tags.length > 0) {
+                    tags.forEach(tag => {
+                        const tagEl = document.createElement('span');
+                        tagEl.className = 'bg-blue-100 text-blue-800 text-xs font-medium px-2.5 py-0.5 rounded';
+                        tagEl.textContent = `${tag.name} (${(tag.confidence * 100).toFixed(0)}%)`;
+                        modalTags.appendChild(tagEl);
+                    });
+                } else {
+                    modalTags.innerHTML = '<span class="text-gray-500">No tags.</span>';
+                }
+                
+                // Populate Objects
+                modalObjects.innerHTML = '';
+                const objects = JSON.parse(item.objects_json || '[]');
+                if (objects.length > 0) {
+                    objects.forEach(obj => {
+                        const li = document.createElement('li');
+                        li.textContent = `${obj.object_property} (${(obj.confidence * 100).toFixed(0)}%)`;
+                        modalObjects.appendChild(li);
+                    });
+                } else {
+                    modalObjects.innerHTML = '<li>No objects detected.</li>';
+                }
+                
+                // 4. Show details
+                modalLoading.classList.add('hidden');
+                modalDetails.classList.remove('hidden');
+
+            } catch (error) {
+                console.error('Failed to load historical record:', error);
+                modalErrorDetails.textContent = error.message;
+                modalLoading.classList.add('hidden');
+                modalError.classList.remove('hidden');
+            }
         }
 
         function closeModal() {

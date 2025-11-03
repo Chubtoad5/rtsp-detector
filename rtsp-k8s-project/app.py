@@ -261,12 +261,14 @@ def get_analysis_history():
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # --- FIX for Schema Collision Error ---
-        # 1. Query for all STRING fields first.
+        # --- FIX for Field Limit Error ---
+        # 1. Query for all STRING fields *EXCEPT* the large frame_b64 field
         query_strings = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
           |> range(start: -30d) 
-          |> filter(fn: (r) => r._measurement == "analysis_record" and r._field != "object_count")
+          |> filter(fn: (r) => r._measurement == "analysis_record" and 
+                             r._field != "object_count" and 
+                             r._field != "frame_b64")
           |> sort(columns: ["_time"], desc: true)
           |> limit(n: 50) 
         '''
@@ -305,10 +307,10 @@ def get_analysis_history():
         # Convert dict to a list
         history_list = list(time_to_data.values())
         
-        # Filter out any incomplete records (e.g., if one query missed a timestamp)
+        # Filter out any incomplete records
         history_list = [
             data for data in history_list
-            if 'description' in data and 'frame_b64' in data and 'object_count' in data
+            if 'description' in data and 'object_count' in data
         ]
         
         # Sort by timestamp descending
@@ -320,13 +322,50 @@ def get_analysis_history():
         logger.error(f"Failed to query InfluxDB for history: {e}")
         return jsonify({'error': f"Failed to retrieve history: {str(e)}"}), 500
 
-@app.route('/get_historical_frame/<timestamp>', methods=['GET'])
-def get_historical_frame(timestamp):
-    """Retrieves the full data record for a specific timestamp."""
-    # This route is no longer needed, as /get_analysis_history now sends
-    # all data needed for the modal, including the frame_b64.
-    # We will leave it here but it's unused by the new index.html.
-    return jsonify({'error': 'This endpoint is deprecated.'}), 404
+@app.route('/get_historical_record/<timestamp>', methods=['GET'])
+def get_historical_record(timestamp):
+    """Retrieves the full data record (including frame) for a specific timestamp."""
+    if not query_api:
+        return jsonify({'error': 'InfluxDB client is not ready.'}), 503
+
+    try:
+        # Convert JS ISO string to RFC3339 format for Flux
+        # 2025-11-02T22:30:00.123Z -> 2025-11-02T22:30:00.123Z
+        # This format is usually fine, but we'll be explicit
+        
+        # We query for a very narrow time window
+        query = f'''
+        from(bucket: "{INFLUXDB_BUCKET}")
+          |> range(start: 0)
+          |> filter(fn: (r) => r._measurement == "analysis_record")
+          |> filter(fn: (r) => r._time == time(v: "{timestamp}"))
+          |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+          |> limit(n: 1)
+        '''
+        
+        tables = query_api.query(query, org=INFLUXDB_ORG)
+        
+        if not tables or not tables[0].records:
+            return jsonify({'error': 'No record found for that timestamp.'}), 404
+
+        # Reconstruct the single record from the pivoted table
+        record_data = tables[0].records[0].values
+        
+        # We only need the fields we're going to display
+        historical_record = {
+            'timestamp': record_data.get('_time', '').isoformat(),
+            'description': record_data.get('description', ''),
+            'tags_json': record_data.get('tags_json', '[]'),
+            'objects_json': record_data.get('objects_json', '[]'),
+            'object_count': record_data.get('object_count', 0),
+            'frame_b64': record_data.get('frame_b64', '')
+        }
+        
+        return jsonify(historical_record)
+
+    except Exception as e:
+        logger.error(f"Failed to query InfluxDB for specific frame: {e}")
+        return jsonify({'error': f"Failed to retrieve frame: {str(e)}"}), 500
 
 if __name__ == '__main__':
     # This is for local development only
