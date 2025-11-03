@@ -358,11 +358,13 @@ def get_historical_record(timestamp):
         # 1. Parse the incoming ISO 8601 timestamp string into a Python datetime object.
         # This handles the complexity of the timezone offset (+00:00).
         dt_obj = datetime.fromisoformat(timestamp)
+        dt_obj_minus_1s = dt_obj - timedelta(seconds=1)
+        dt_obj_plus_1s = dt_obj + timedelta(seconds=1)
         
         # 2. Define a small time range (e.g., +/- 1 second) around the timestamp.
         # This handles small precision differences between the query time and the stored time.
-        start_time = (dt_obj - timedelta(seconds=1)).isoformat()
-        end_time = (dt_obj + timedelta(seconds=1)).isoformat()
+        start_time = dt_obj_minus_1s.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        end_time = dt_obj_plus_1s.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
         # 3. Query the range and filter by measurement
         query = f'''
