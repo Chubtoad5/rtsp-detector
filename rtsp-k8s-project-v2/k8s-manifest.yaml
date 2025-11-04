@@ -15,7 +15,6 @@ stringData:
   AZURE_VISION_ENDPOINT: "https://your-endpoint.cognitiveservices.azure.com/"
   
   # --- Camera Configuration ---
-  CAMERA_SOURCE: "rtsp"
   RTSP_STREAM_URL: "rtsp://your-stream-url-here"
   
   # --- InfluxDB Connection Details (MUST MATCH k8s-influxdb.yaml) ---

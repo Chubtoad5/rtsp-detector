@@ -7,8 +7,8 @@ import cv2
 import numpy as np
 import base64
 import io
-from urllib.parse import urlparse, urlunparse
-from datetime import datetime, timedelta # Added for history modal fix
+import uuid # --- HISTORY REFACTOR: Import UUID ---
+import re # For sanitizing RTSP URL
 
 from flask import Flask, render_template, Response, jsonify, request
 from azure.cognitiveservices.vision.computervision import ComputerVisionClient
@@ -16,7 +16,9 @@ from msrest.authentication import CognitiveServicesCredentials
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
-import datetime as dt
+from datetime import datetime
+from dateutil import parser # --- HISTORY REFACTOR: Import dateutil.parser ---
+import datetime as dt # Use a distinct alias for timedelta
 
 # =============================================================================
 # CONFIGURATION
@@ -39,34 +41,13 @@ MIN_OBJECT_CONFIDENCE = 0.60  # Minimum confidence (0.0 to 1.0) required for dis
 # --- Environment Variables ---
 AZURE_VISION_KEY = os.environ.get("AZURE_VISION_SUBSCRIPTION_KEY")
 AZURE_VISION_ENDPOINT = os.environ.get("AZURE_VISION_ENDPOINT")
-RTSP_STREAM_URL = os.environ.get("RTSP_STREAM_URL")
+RTSP_STREAM_URL = os.environ.get("RTSP_STREAM_URL", "rtsp://user:pass@example.com") # Get URL for display
 
 # --- InfluxDB Config (From k8s-manifest.yaml Secret) ---
 INFLUXDB_URL = os.environ.get("INFLUXDB_URL")
 INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN")
 INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG")
 INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET")
-
-# --- Create Sanitized RTSP URL for Frontend ---
-SANITIZED_RTSP_URL = "Not Configured"
-if RTSP_STREAM_URL:
-    try:
-        # Try to parse and remove user/pass
-        parsed = urlparse(RTSP_STREAM_URL)
-        # Rebuild URL without netloc user/pass
-        netloc_parts = parsed.netloc.split('@')
-        sanitized_netloc = netloc_parts[-1] # Get the part after '@', or the whole thing
-        SANITIZED_RTSP_URL = urlunparse((
-            parsed.scheme,
-            sanitized_netloc,
-            parsed.path,
-            parsed.params,
-            parsed.query,
-            parsed.fragment
-        ))
-    except Exception:
-        SANITIZED_RTSP_URL = "rtsp://... (Stream Configured)"
-
 
 # =============================================================================
 # INITIALIZATION
@@ -109,6 +90,9 @@ if INFLUXDB_URL and INFLUXDB_TOKEN and INFLUXDB_ORG and INFLUXDB_BUCKET:
 else:
     logger.warning("InfluxDB credentials missing. History feature will be disabled.")
 
+# 4. Sanitize RTSP URL for display
+sanitized_rtsp_url = re.sub(r":\/\/(.*):(.*)@", "://*:*@", RTSP_STREAM_URL)
+
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -139,18 +123,27 @@ def save_analysis_to_db(analysis_data, frame_b64):
         return
 
     try:
-        # Prepare fields for InfluxDB point
-        point = Point("analysis_record").tag("source", "rtsp-stream")
-
+        # --- HISTORY REFACTOR: Generate a unique ID ---
+        record_id = str(uuid.uuid4())
+        
+        point = Point("analysis_record")
+        
+        # --- HISTORY REFACTOR: Add record_id as a tag for fast lookups ---
+        point.tag("record_id", record_id)
+        point.tag("source", "rtsp-stream")
+        
         # Add data fields
         point.field("description", analysis_data.get('description_text', ''))
         point.field("tags_json", json.dumps(analysis_data.get('tags', [])))
         point.field("objects_json", json.dumps(analysis_data.get('objects', [])))
         point.field("object_count", len(analysis_data.get('objects', [])))
-        point.field("frame_b64", frame_b64) # Store the annotated frame as base64 string
+        point.field("frame_b64", frame_b64)
+        
+        # --- HISTORY REFACTOR: Also save record_id as a field to retrieve in list queries ---
+        point.field("record_id", record_id)
 
         write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
-        logger.info(f"Analysis saved to InfluxDB with {len(analysis_data.get('objects', []))} objects.")
+        logger.info(f"Analysis saved to InfluxDB with record_id: {record_id}")
     except Exception as e:
         logger.error(f"Failed to write analysis to InfluxDB: {e}")
 
@@ -208,7 +201,7 @@ def run_analysis_task():
         _, buffer_boxes = cv2.imencode('.jpg', frame_with_boxes)
         frame_b64 = base64.b64encode(buffer_boxes.tobytes()).decode('utf-8')
         
-        # 7. Save to InfluxDB
+        # 7. Save to InfluxDB (This happens every time, even if no objects)
         save_analysis_to_db(results, frame_b64)
 
         return results
@@ -225,9 +218,10 @@ def run_analysis_task():
 @app.route('/')
 def index():
     """Serves the main HTML page."""
-    return render_template('index.html', 
+    # Pass the sanitized RTSP URL to the template
+    return render_template('index.html',
                            min_confidence=MIN_OBJECT_CONFIDENCE,
-                           rtsp_url=SANITIZED_RTSP_URL) # Pass sanitized URL
+                           rtsp_url=sanitized_rtsp_url)
 
 def generate_frames():
     """Generator function that yields frames from shared memory."""
@@ -286,14 +280,14 @@ def get_analysis_history():
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # --- FIX for Field Limit Error (as before) ---
-        # 1. Query for all STRING fields *EXCEPT* the large frame_b64 field
+        # --- HISTORY REFACTOR: Query for string fields + record_id ---
+        # We only fetch the fields needed for the list view
         query_strings = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
           |> range(start: -30d) 
-          |> filter(fn: (r) => r._measurement == "analysis_record" and 
-                             r._field != "object_count" and 
-                             r._field != "frame_b64")
+          |> filter(fn: (r) => r._measurement == "analysis_record" 
+                             and (r._field == "description" 
+                             or r._field == "record_id"))
           |> sort(columns: ["_time"], desc: true)
           |> limit(n: 50) 
         '''
@@ -311,7 +305,7 @@ def get_analysis_history():
                 field_value = record.values['_value']
                 time_to_data[ts][field_name] = field_value
 
-        # 2. Query for the INTEGER field 'object_count' separately.
+        # --- HISTORY REFACTOR: Query for integer field ---
         query_int = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
           |> range(start: -30d) 
@@ -321,73 +315,55 @@ def get_analysis_history():
         '''
         tables_int = query_api.query(query_int, org=INFLUXDB_ORG)
         
-        # 3. Merge integer data back into the main dictionary.
         for table in tables_int:
             for record in table.records:
                 ts = record.values['_time'].isoformat()
                 if ts in time_to_data: # Only add if we have the string data
                     time_to_data[ts]['object_count'] = record.values['_value']
-
-
-        # Convert dict to a list
+        
         history_list = list(time_to_data.values())
         
-        # Filter out any incomplete records
+        # Filter out incomplete records
         history_list = [
             data for data in history_list
-            if 'description' in data and 'object_count' in data
+            if 'description' in data and 'object_count' in data and 'record_id' in data
         ]
         
-        # Sort by timestamp descending
         history_list.sort(key=lambda x: x['timestamp'], reverse=True)
         
-        return jsonify(history_list[:10]) # Return top 10 recent complete records
+        return jsonify(history_list[:10])
 
     except Exception as e:
         logger.error(f"Failed to query InfluxDB for history: {e}")
         return jsonify({'error': f"Failed to retrieve history: {str(e)}"}), 500
 
-@app.route('/get_historical_record/<path:timestamp>', methods=['GET'])
-def get_historical_record(timestamp):
-    """Retrieves the full data record (including frame) for a specific timestamp."""
+# --- HISTORY REFACTOR: New route to get by record_id ---
+@app.route('/get_historical_record/<string:record_id>', methods=['GET'])
+def get_historical_record(record_id):
+    """Retrieves the full data record (including frame) for a specific record_id."""
     if not query_api:
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # --- FIX #1: Timestamp lookup robustness ---
-        # 1. Parse the incoming ISO 8601 timestamp string into a Python datetime object.
-        # This handles the complexity of the timezone offset (+00:00).
-        dt_obj = datetime.fromisoformat(timestamp)
-        dt_obj_minus_1s = dt_obj - timedelta(seconds=1)
-        dt_obj_plus_1s = dt_obj + timedelta(seconds=1)
-        
-        # 2. Define a small time range (e.g., +/- 1 second) around the timestamp.
-        # This handles small precision differences between the query time and the stored time.
-        start_time = dt_obj_minus_1s.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        end_time = dt_obj_plus_1s.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-
-        # 3. Query the range and filter by measurement
+        # --- HISTORY REFACTOR: Simple, robust query by tag 'record_id' ---
         query = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
-          |> range(start: time(v: "{start_time}"), stop: time(v: "{end_time}"))
+          |> range(start: -30d) # Keep a reasonable range for performance
           |> filter(fn: (r) => r._measurement == "analysis_record")
-          |> filter(fn: (r) => r._time == time(v: "{timestamp}")) # Added for stricter filter
+          |> filter(fn: (r) => r.record_id == "{record_id}") 
+          |> last() # Get the most recent matching record (should only be one)
           |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-          |> limit(n: 1)
         '''
         
         tables = query_api.query(query, org=INFLUXDB_ORG)
         
         if not tables or not tables[0].records:
-            logger.warning(f"No record found for timestamp: {timestamp}")
-            return jsonify({'error': 'No record found for that timestamp.'}), 404
+            logger.warning(f"No record found for record_id: {record_id}")
+            return jsonify({'error': 'No record found for that ID.'}), 404
 
-        # Reconstruct the single record from the pivoted table
         record_data = tables[0].records[0].values
         
-        # We only need the fields we're going to display
         historical_record = {
-            # Use the record's time for the timestamp
             'timestamp': record_data.get('_time', '').isoformat(), 
             'description': record_data.get('description', ''),
             'tags_json': record_data.get('tags_json', '[]'),
@@ -398,11 +374,8 @@ def get_historical_record(timestamp):
         
         return jsonify(historical_record)
 
-    except ValueError:
-        logger.error(f"Invalid timestamp format received: {timestamp}")
-        return jsonify({'error': 'Invalid timestamp format provided.'}), 400
     except Exception as e:
-        logger.error(f"Failed to query InfluxDB for specific frame: {e} (Timestamp: {timestamp})")
+        logger.error(f"Failed to query InfluxDB for specific frame: {e} (ID: {record_id})")
         return jsonify({'error': f"Failed to retrieve frame: {str(e)}"}), 500
 
 if __name__ == '__main__':

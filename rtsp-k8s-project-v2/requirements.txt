@@ -6,3 +6,4 @@ numpy
 azure-cognitiveservices-vision-computervision
 msrest
 influxdb-client
+python-dateutil

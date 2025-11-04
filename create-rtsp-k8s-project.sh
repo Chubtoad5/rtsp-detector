@@ -9,7 +9,7 @@ mkdir -p $PROJECT_DIR/static
 
 echo "--- Created directory $PROJECT_DIR/ ---"
 
-# --- 1. README.md (NEW INSTRUCTIONS!) ---
+# --- 1. README.md ---
 cat <<'EOF' > $PROJECT_DIR/README.md
 # RTSP Object Detector - v2 Deployment Guide
 
@@ -121,6 +121,7 @@ numpy
 azure-cognitiveservices-vision-computervision
 msrest
 influxdb-client
+python-dateutil
 EOF
 
 echo "--- Created requirements.txt ---"
@@ -217,7 +218,6 @@ stringData:
   AZURE_VISION_ENDPOINT: "https://your-endpoint.cognitiveservices.azure.com/"
   
   # --- Camera Configuration ---
-  CAMERA_SOURCE: "rtsp"
   RTSP_STREAM_URL: "rtsp://your-stream-url-here"
   
   # --- InfluxDB Connection Details (MUST MATCH k8s-influxdb.yaml) ---
@@ -345,8 +345,8 @@ import cv2
 import numpy as np
 import base64
 import io
-from urllib.parse import urlparse, urlunparse
-from datetime import datetime, timedelta # Added for history modal fix
+import uuid # --- HISTORY REFACTOR: Import UUID ---
+import re # For sanitizing RTSP URL
 
 from flask import Flask, render_template, Response, jsonify, request
 from azure.cognitiveservices.vision.computervision import ComputerVisionClient
@@ -354,7 +354,9 @@ from msrest.authentication import CognitiveServicesCredentials
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
-import datetime as dt
+from datetime import datetime
+from dateutil import parser # --- HISTORY REFACTOR: Import dateutil.parser ---
+import datetime as dt # Use a distinct alias for timedelta
 
 # =============================================================================
 # CONFIGURATION
@@ -377,34 +379,13 @@ MIN_OBJECT_CONFIDENCE = 0.60  # Minimum confidence (0.0 to 1.0) required for dis
 # --- Environment Variables ---
 AZURE_VISION_KEY = os.environ.get("AZURE_VISION_SUBSCRIPTION_KEY")
 AZURE_VISION_ENDPOINT = os.environ.get("AZURE_VISION_ENDPOINT")
-RTSP_STREAM_URL = os.environ.get("RTSP_STREAM_URL")
+RTSP_STREAM_URL = os.environ.get("RTSP_STREAM_URL", "rtsp://user:pass@example.com") # Get URL for display
 
 # --- InfluxDB Config (From k8s-manifest.yaml Secret) ---
 INFLUXDB_URL = os.environ.get("INFLUXDB_URL")
 INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN")
 INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG")
 INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET")
-
-# --- Create Sanitized RTSP URL for Frontend ---
-SANITIZED_RTSP_URL = "Not Configured"
-if RTSP_STREAM_URL:
-    try:
-        # Try to parse and remove user/pass
-        parsed = urlparse(RTSP_STREAM_URL)
-        # Rebuild URL without netloc user/pass
-        netloc_parts = parsed.netloc.split('@')
-        sanitized_netloc = netloc_parts[-1] # Get the part after '@', or the whole thing
-        SANITIZED_RTSP_URL = urlunparse((
-            parsed.scheme,
-            sanitized_netloc,
-            parsed.path,
-            parsed.params,
-            parsed.query,
-            parsed.fragment
-        ))
-    except Exception:
-        SANITIZED_RTSP_URL = "rtsp://... (Stream Configured)"
-
 
 # =============================================================================
 # INITIALIZATION
@@ -447,6 +428,9 @@ if INFLUXDB_URL and INFLUXDB_TOKEN and INFLUXDB_ORG and INFLUXDB_BUCKET:
 else:
     logger.warning("InfluxDB credentials missing. History feature will be disabled.")
 
+# 4. Sanitize RTSP URL for display
+sanitized_rtsp_url = re.sub(r":\/\/(.*):(.*)@", "://*:*@", RTSP_STREAM_URL)
+
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -477,18 +461,27 @@ def save_analysis_to_db(analysis_data, frame_b64):
         return
 
     try:
-        # Prepare fields for InfluxDB point
-        point = Point("analysis_record").tag("source", "rtsp-stream")
-
+        # --- HISTORY REFACTOR: Generate a unique ID ---
+        record_id = str(uuid.uuid4())
+        
+        point = Point("analysis_record")
+        
+        # --- HISTORY REFACTOR: Add record_id as a tag for fast lookups ---
+        point.tag("record_id", record_id)
+        point.tag("source", "rtsp-stream")
+        
         # Add data fields
         point.field("description", analysis_data.get('description_text', ''))
         point.field("tags_json", json.dumps(analysis_data.get('tags', [])))
         point.field("objects_json", json.dumps(analysis_data.get('objects', [])))
         point.field("object_count", len(analysis_data.get('objects', [])))
-        point.field("frame_b64", frame_b64) # Store the annotated frame as base64 string
+        point.field("frame_b64", frame_b64)
+        
+        # --- HISTORY REFACTOR: Also save record_id as a field to retrieve in list queries ---
+        point.field("record_id", record_id)
 
         write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
-        logger.info(f"Analysis saved to InfluxDB with {len(analysis_data.get('objects', []))} objects.")
+        logger.info(f"Analysis saved to InfluxDB with record_id: {record_id}")
     except Exception as e:
         logger.error(f"Failed to write analysis to InfluxDB: {e}")
 
@@ -546,7 +539,7 @@ def run_analysis_task():
         _, buffer_boxes = cv2.imencode('.jpg', frame_with_boxes)
         frame_b64 = base64.b64encode(buffer_boxes.tobytes()).decode('utf-8')
         
-        # 7. Save to InfluxDB
+        # 7. Save to InfluxDB (This happens every time, even if no objects)
         save_analysis_to_db(results, frame_b64)
 
         return results
@@ -563,9 +556,10 @@ def run_analysis_task():
 @app.route('/')
 def index():
     """Serves the main HTML page."""
-    return render_template('index.html', 
+    # Pass the sanitized RTSP URL to the template
+    return render_template('index.html',
                            min_confidence=MIN_OBJECT_CONFIDENCE,
-                           rtsp_url=SANITIZED_RTSP_URL) # Pass sanitized URL
+                           rtsp_url=sanitized_rtsp_url)
 
 def generate_frames():
     """Generator function that yields frames from shared memory."""
@@ -624,14 +618,14 @@ def get_analysis_history():
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # --- FIX for Field Limit Error (as before) ---
-        # 1. Query for all STRING fields *EXCEPT* the large frame_b64 field
+        # --- HISTORY REFACTOR: Query for string fields + record_id ---
+        # We only fetch the fields needed for the list view
         query_strings = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
           |> range(start: -30d) 
-          |> filter(fn: (r) => r._measurement == "analysis_record" and 
-                             r._field != "object_count" and 
-                             r._field != "frame_b64")
+          |> filter(fn: (r) => r._measurement == "analysis_record" 
+                             and (r._field == "description" 
+                             or r._field == "record_id"))
           |> sort(columns: ["_time"], desc: true)
           |> limit(n: 50) 
         '''
@@ -649,7 +643,7 @@ def get_analysis_history():
                 field_value = record.values['_value']
                 time_to_data[ts][field_name] = field_value
 
-        # 2. Query for the INTEGER field 'object_count' separately.
+        # --- HISTORY REFACTOR: Query for integer field ---
         query_int = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
           |> range(start: -30d) 
@@ -659,73 +653,55 @@ def get_analysis_history():
         '''
         tables_int = query_api.query(query_int, org=INFLUXDB_ORG)
         
-        # 3. Merge integer data back into the main dictionary.
         for table in tables_int:
             for record in table.records:
                 ts = record.values['_time'].isoformat()
                 if ts in time_to_data: # Only add if we have the string data
                     time_to_data[ts]['object_count'] = record.values['_value']
-
-
-        # Convert dict to a list
+        
         history_list = list(time_to_data.values())
         
-        # Filter out any incomplete records
+        # Filter out incomplete records
         history_list = [
             data for data in history_list
-            if 'description' in data and 'object_count' in data
+            if 'description' in data and 'object_count' in data and 'record_id' in data
         ]
         
-        # Sort by timestamp descending
         history_list.sort(key=lambda x: x['timestamp'], reverse=True)
         
-        return jsonify(history_list[:10]) # Return top 10 recent complete records
+        return jsonify(history_list[:10])
 
     except Exception as e:
         logger.error(f"Failed to query InfluxDB for history: {e}")
         return jsonify({'error': f"Failed to retrieve history: {str(e)}"}), 500
 
-@app.route('/get_historical_record/<path:timestamp>', methods=['GET'])
-def get_historical_record(timestamp):
-    """Retrieves the full data record (including frame) for a specific timestamp."""
+# --- HISTORY REFACTOR: New route to get by record_id ---
+@app.route('/get_historical_record/<string:record_id>', methods=['GET'])
+def get_historical_record(record_id):
+    """Retrieves the full data record (including frame) for a specific record_id."""
     if not query_api:
         return jsonify({'error': 'InfluxDB client is not ready.'}), 503
 
     try:
-        # --- FIX #1: Timestamp lookup robustness ---
-        # 1. Parse the incoming ISO 8601 timestamp string into a Python datetime object.
-        # This handles the complexity of the timezone offset (+00:00).
-        dt_obj = datetime.fromisoformat(timestamp)
-        dt_obj_minus_1s = dt_obj - timedelta(seconds=1)
-        dt_obj_plus_1s = dt_obj + timedelta(seconds=1)
-        
-        # 2. Define a small time range (e.g., +/- 1 second) around the timestamp.
-        # This handles small precision differences between the query time and the stored time.
-        start_time = dt_obj_minus_1s.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        end_time = dt_obj_plus_1s.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-
-        # 3. Query the range and filter by measurement
+        # --- HISTORY REFACTOR: Simple, robust query by tag 'record_id' ---
         query = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
-          |> range(start: time(v: "{start_time}"), stop: time(v: "{end_time}"))
+          |> range(start: -30d) # Keep a reasonable range for performance
           |> filter(fn: (r) => r._measurement == "analysis_record")
-          |> filter(fn: (r) => r._time == time(v: "{timestamp}")) # Added for stricter filter
+          |> filter(fn: (r) => r.record_id == "{record_id}") 
+          |> last() # Get the most recent matching record (should only be one)
           |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-          |> limit(n: 1)
         '''
         
         tables = query_api.query(query, org=INFLUXDB_ORG)
         
         if not tables or not tables[0].records:
-            logger.warning(f"No record found for timestamp: {timestamp}")
-            return jsonify({'error': 'No record found for that timestamp.'}), 404
+            logger.warning(f"No record found for record_id: {record_id}")
+            return jsonify({'error': 'No record found for that ID.'}), 404
 
-        # Reconstruct the single record from the pivoted table
         record_data = tables[0].records[0].values
         
-        # We only need the fields we're going to display
         historical_record = {
-            # Use the record's time for the timestamp
             'timestamp': record_data.get('_time', '').isoformat(), 
             'description': record_data.get('description', ''),
             'tags_json': record_data.get('tags_json', '[]'),
@@ -736,11 +712,8 @@ def get_historical_record(timestamp):
         
         return jsonify(historical_record)
 
-    except ValueError:
-        logger.error(f"Invalid timestamp format received: {timestamp}")
-        return jsonify({'error': 'Invalid timestamp format provided.'}), 400
     except Exception as e:
-        logger.error(f"Failed to query InfluxDB for specific frame: {e} (Timestamp: {timestamp})")
+        logger.error(f"Failed to query InfluxDB for specific frame: {e} (ID: {record_id})")
         return jsonify({'error': f"Failed to retrieve frame: {str(e)}"}), 500
 
 if __name__ == '__main__':
@@ -807,20 +780,16 @@ def run_camera():
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
 
-    # --- FIX: Removed outer unnecessary 'try:' block ---
-    
-    # Create or connect to the shared memory block
     try:
+        # Create or connect to the shared memory block
         shm = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHARED_BUFFER_SIZE)
         logger.info(f"Shared memory block '{SHM_NAME}' created.")
     except FileExistsError:
         shm = shared_memory.SharedMemory(name=SHM_NAME, create=False, size=SHARED_BUFFER_SIZE)
         logger.info(f"Shared memory block '{SHM_NAME}' already exists, connecting.")
     except Exception as e:
-        # Handle case where SHM fails entirely (e.g., system resource limit)
         logger.error(f"FATAL: Failed to create/connect to shared memory: {e}")
-        # Terminate gracefully since the app cannot function without shared memory
-        cleanup(signal.SIGTERM, None) 
+        sys.exit(1) # Exit immediately if we can't get shared memory
 
     # Create a NumPy array backed by the shared memory buffer
     shared_frame_array = np.ndarray((FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS), dtype=np.uint8, buffer=shm.buf)
@@ -841,6 +810,7 @@ def run_camera():
             camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             # 2. Read and discard initial frames to clear the stream buffer (fast grab)
+            logger.info("Clearing camera buffer...")
             for _ in range(5): 
                 camera.grab() 
 
@@ -920,13 +890,6 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
             transition: all 0.25s ease;
             max-height: 90vh;
         }
-        .spinner {
-            border-top-color: transparent;
-            animation: spin 1s linear infinite;
-        }
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
     </style>
 </head>
 <body class="bg-gray-100 text-gray-900">
@@ -944,16 +907,15 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 </div>
 
                 <!-- Controls -->
-                <div class="mt-6 flex flex-col gap-4">
-                    <button id="analyzeButton" class="w-full bg-green-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-green-700 transition duration-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center">
+                <div class.mt-6 flex flex-col sm:flex-row gap-4 items-center">
+                    <button id="analyzeButton" class="w-full sm:w-auto bg-green-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-green-700 transition duration-300 disabled:opacity-50 disabled:cursor-not-allowed">
                         <span id="analyzeSpinner" class="hidden mr-2 w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
                         <span id="analyzeText">Analyze Current Frame</span>
                     </button>
-
-                    <!-- Sanitized RTSP URL Display -->
-                    <div class="w-full text-center p-3 bg-gray-100 rounded-lg">
-                        <span class="font-medium text-gray-700">Monitoring Stream:</span>
-                        <span class="text-gray-900 font-mono text-sm break-all">{{ rtsp_url | e }}</span>
+                    <!-- UI CHANGE: Display RTSP URL -->
+                    <div class="flex-1 text-center sm:text-left">
+                        <span class="font-semibold text-gray-700">Monitoring:</span>
+                        <span id="rtspUrlDisplay" class="text-gray-600 text-sm break-all">{{ rtsp_url }}</span>
                     </div>
                 </div>
 
@@ -965,7 +927,7 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                     <h2 class="text-2xl font-semibold border-b border-gray-300 pb-2 mb-4">Current Analysis</h2>
                     <div id="currentAnalysisResults" class="space-y-3">
                         <p><strong>Description:</strong> <span id="descriptionText" class="text-gray-700">No analysis yet.</span></p>
-                        <p><strong>Tags:</strong> <span id="tagsList" class="text-gray-700">No analysis yet.</span></p>
+                        <p><strong>Tags:</strong> <span id="tagsList" class="text-gray-700">No tags available.</span></p>
                         <div>
                             <p><strong>Detected Objects (Min. {{ (min_confidence * 100) }}% confidence):</strong></p>
                             <ul id="objectsList" class="list-disc list-inside text-gray-700 pl-4">
@@ -999,19 +961,10 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 <h2 class="text-2xl font-semibold">Historical Analysis</h2>
                 <button id="closeModalBtn" class="text-gray-500 hover:text-gray-800 text-3xl">&times;</button>
             </div>
-            
             <!-- Modal Body -->
-            <div id="modalLoading" class="hidden p-6 text-center">
-                <div class="w-12 h-12 border-4 border-blue-500 spinner rounded-full inline-block"></div>
-                <p class="text-lg font-medium mt-4">Loading full record...</p>
-            </div>
-
-            <div id="modalError" class="hidden p-6 text-center">
-                <p class="text-lg font-medium text-red-600">Failed to load record.</p>
-                <p id="modalErrorDetails" class="text-gray-700"></p>
-            </div>
-
-            <div id="modalDetails" class="p-6 grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div id="modalLoading" class="p-6 text-center">Loading record...</div>
+            <div id="modalError" class="p-6 text-red-600 hidden"></div>
+            <div id="modalDetails" class="hidden p-6 grid grid-cols-1 md:grid-cols-2 gap-6">
                 <!-- Modal Image -->
                 <div>
                     <h3 class="text-xl font-semibold mb-2">Analyzed Frame</h3>
@@ -1039,9 +992,6 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
     </div>
 
     <script>
-        // --- Globals ---
-        let boxClearTimer = null; // Timer to clear bounding boxes
-
         // --- DOM Elements ---
         const videoFeed = document.getElementById('videoFeed');
         const overlayCanvas = document.getElementById('overlayCanvas');
@@ -1063,14 +1013,12 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
         const historyList = document.getElementById('historyList');
         const historyLoading = document.getElementById('historyLoading');
         const historyError = document.getElementById('historyError');
-        let analysisHistoryCache = []; // Cache to hold METADATA only
-
+        
         // Modal Elements
         const historyModal = document.getElementById('historyModal');
         const closeModalBtn = document.getElementById('closeModalBtn');
         const modalLoading = document.getElementById('modalLoading');
         const modalError = document.getElementById('modalError');
-        const modalErrorDetails = document.getElementById('modalErrorDetails');
         const modalDetails = document.getElementById('modalDetails');
         
         const modalImage = document.getElementById('modalImage');
@@ -1079,11 +1027,14 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
         const modalTags = document.getElementById('modalTags');
         const modalObjects = document.getElementById('modalObjects');
 
+        // --- Global State ---
+        let boxClearTimer = null; // Timer for clearing bounding boxes
+
         // --- Event Listeners ---
         
         // Analyze Button
         analyzeButton.addEventListener('click', handleAnalyzeFrame);
-
+        
         // History Buttons
         refreshHistoryBtn.addEventListener('click', loadHistory);
 
@@ -1130,16 +1081,18 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
             setAnalyzeButtonState(true, 'Analyzing...');
             showStatus('');
             
-            // Clear any existing boxes and timers
+            // --- BOUNDING BOX 3-SECOND TIMEOUT ---
+            // Clear any existing timer and boxes
             if (boxClearTimer) clearTimeout(boxClearTimer);
             ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            // ----------------------------------------
+            
             clearCurrentAnalysisDetails();
 
             try {
                 const response = await fetch('/analyze_current_frame', { method: 'POST' });
                 
                 if (!response.ok) {
-                    // Try to parse error from server
                     let errorMsg = `HTTP error! Status: ${response.status}`;
                     try {
                         const errData = await response.json();
@@ -1161,12 +1114,6 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 populateCurrentAnalysisDetails(data);
                 drawBoxesOnCanvas(data.objects);
                 loadHistory(); // Refresh history after analysis
-
-                // **FIX #2**: Clear boxes after 3 seconds
-                boxClearTimer = setTimeout(() => {
-                    ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-                    boxClearTimer = null;
-                }, 3000);
 
             } catch (error) {
                 console.error('Analysis error:', error);
@@ -1203,14 +1150,11 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
         }
 
         function drawBoxesOnCanvas(objects) {
-            // Resize canvas before drawing to ensure correct dimensions
-            resizeCanvas(); 
-
             ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
             
-            // Get scaling factors (1280x720 is the known server frame size)
-            const scaleX = overlayCanvas.width / 1280; 
-            const scaleY = overlayCanvas.height / 720; 
+            // Get scaling factors
+            const scaleX = overlayCanvas.width / 1280; // 1280 is the original frame width
+            const scaleY = overlayCanvas.height / 720; // 720 is the original frame height
 
             ctx.strokeStyle = '#00BFFF'; // Deep Sky Blue
             ctx.lineWidth = 2;
@@ -1227,9 +1171,15 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 ctx.strokeRect(x, y, w, h);
                 
                 const label = `${obj.object_property} (${(obj.confidence * 100).toFixed(0)}%)`;
-                // Position text slightly above the box
-                ctx.fillText(label, x, y > 20 ? y - 5 : y + h + 15); 
+                ctx.fillText(label, x, y > 20 ? y - 5 : y + h + 15);
             });
+            
+            // --- BOUNDING BOX 3-SECOND TIMEOUT ---
+            // Set a timer to clear the boxes
+            boxClearTimer = setTimeout(() => {
+                ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            }, 3000); // 3000 milliseconds = 3 seconds
+            // ----------------------------------------
         }
 
         // --- History Functions ---
@@ -1243,16 +1193,11 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
             try {
                 const response = await fetch('/get_analysis_history');
                 if (!response.ok) {
-                    let errorMsg = `HTTP Error ${response.status}`;
-                    try {
-                        const errData = await response.json();
-                        errorMsg = errData.error || errorMsg;
-                    } catch(e) { /* response wasn't json */ }
-                    throw new Error(errorMsg);
+                    const errData = await response.json();
+                    throw new Error(errData.error || `HTTP Error ${response.status}`);
                 }
                 
                 const data = await response.json();
-                analysisHistoryCache = data; // Store METADATA in cache
                 renderHistoryList(data);
 
             } catch (error) {
@@ -1279,6 +1224,10 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                 const date = new Date(item.timestamp);
                 const li = document.createElement('li');
                 li.className = 'p-3 rounded-lg border hover:bg-gray-50 cursor-pointer flex justify-between items-center';
+                
+                // --- HISTORY REFACTOR: Store record_id in data attribute ---
+                li.dataset.recordId = item.record_id;
+                
                 li.innerHTML = `
                     <div>
                         <span class="font-semibold">${date.toLocaleString()}</span>
@@ -1286,43 +1235,31 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                     </div>
                     <span class="text-sm font-medium text-blue-600">${item.object_count} Object(s)</span>
                 `;
-                // Pass the unique timestamp to openModal
-                li.addEventListener('click', () => openModal(item.timestamp));
+                
+                // --- HISTORY REFACTOR: Pass record_id to openModal ---
+                li.addEventListener('click', () => openModal(item.record_id));
                 historyList.appendChild(li);
             });
         }
 
-        async function openModal(timestamp) {
-            // 1. Show modal in loading state
+        // --- HISTORY REFACTOR: Function now accepts record_id ---
+        async function openModal(record_id) {
+            // 1. Show modal and loading state
             historyModal.classList.remove('opacity-0', 'pointer-events-none');
             historyModal.querySelector('.modal-content').classList.remove('scale-95', 'opacity-0');
+            modalLoading.classList.remove('hidden');
             modalDetails.classList.add('hidden');
             modalError.classList.add('hidden');
-            modalLoading.classList.remove('hidden');
-            
+
             try {
-                // 2. Fetch the full record from the new endpoint
-                // **FIX #1**: Use encodeURIComponent to safely pass the timestamp string 
-                // containing the '+' offset to the backend.
-                const response = await fetch(`/get_historical_record/${encodeURIComponent(timestamp)}`);
-                
+                // 2. Fetch the single, full record from the server
+                // --- HISTORY REFACTOR: Use the new /get_historical_record/<record_id> route ---
+                const response = await fetch(`/get_historical_record/${record_id}`);
                 if (!response.ok) {
-                    let errorMsg = `HTTP Error ${response.status}`;
-                    try {
-                        const errData = await response.json();
-                        errorMsg = errData.error || errorMsg;
-                    } catch(e) { 
-                        const textError = await response.text();
-                        throw new Error(`Server returned: ${response.status}. Response: ${textError.substring(0, 100)}...`);
-                    }
-                    throw new Error(errorMsg);
+                    const errData = await response.json();
+                    throw new Error(errData.error || `HTTP Error ${response.status}`);
                 }
-                
                 const item = await response.json();
-                
-                if (item.error) {
-                    throw new Error(item.error);
-                }
 
                 // 3. Populate modal with full data
                 modalImage.src = `data:image/jpeg;base64,${item.frame_b64}`;
@@ -1356,13 +1293,13 @@ cat <<'EOF' > $PROJECT_DIR/templates/index.html
                     modalObjects.innerHTML = '<li>No objects detected.</li>';
                 }
                 
-                // 4. Show details
+                // 4. Show details, hide loading
                 modalLoading.classList.add('hidden');
                 modalDetails.classList.remove('hidden');
 
             } catch (error) {
-                console.error('Failed to load historical record:', error);
-                modalErrorDetails.textContent = error.message;
+                console.error("Failed to load historical record:", error);
+                modalError.textContent = `Failed to load record: ${error.message}`;
                 modalLoading.classList.add('hidden');
                 modalError.classList.remove('hidden');
             }
@@ -1385,3 +1322,4 @@ echo "✅ All files generated in $PROJECT_DIR/"
 echo "---"
 echo "IMPORTANT: Remember to manually add your 'camera_unavailable.jpg' file to the '$PROJECT_DIR/static/' directory."
 echo "Next, follow the instructions in '$PROJECT_DIR/README.md' to build, push, and deploy."
+
