@@ -12,8 +12,14 @@ credit to their respective authors):
   OpenCV (python-headless) Apache-2.0  https://github.com/opencv/opencv
   NumPy                   BSD-3-Clause https://github.com/numpy/numpy
   Azure AI Vision SDKs    MIT          https://github.com/Azure/azure-sdk-for-python
+  ffmpeg                  GPL-2.0+     https://ffmpeg.org/   (installed via apt in the Dockerfile)
 
 The Azure AI Vision service itself is a proprietary Microsoft cloud service; this
-software calls it with a key that you supply and does not redistribute it. When a
-container image built from this project is published, it redistributes the above
-components — retain their copyright/license notices.
+software calls it with a key that you supply and does not redistribute it.
+
+The Dockerfile installs ffmpeg (and OpenCV's OS deps) from the Debian/Ubuntu base
+image, where ffmpeg is a GPL-2.0-or-later build. When you BUILD and PUBLISH a container
+image from this project you redistribute that GPL ffmpeg: retain its license, and make
+the corresponding source available (it is available from the base distribution's source
+archives, e.g. 'apt-get source ffmpeg', or provide a written offer). All other bundled
+components are permissive — retain their copyright/license notices.
