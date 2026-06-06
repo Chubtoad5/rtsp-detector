@@ -1,0 +1,19 @@
+RTSP Object Detector (Kubernetes)
+Copyright (C) 2026 Chubtoad5
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This is an original application. It builds on, and at runtime calls, the following
+third-party open-source software and services, each under its own license (all
+credit to their respective authors):
+
+  Flask                   BSD-3-Clause https://github.com/pallets/flask
+  Gunicorn                MIT          https://github.com/benoitc/gunicorn
+  OpenCV (python-headless) Apache-2.0  https://github.com/opencv/opencv
+  NumPy                   BSD-3-Clause https://github.com/numpy/numpy
+  Azure AI Vision SDKs    MIT          https://github.com/Azure/azure-sdk-for-python
+
+The Azure AI Vision service itself is a proprietary Microsoft cloud service; this
+software calls it with a key that you supply and does not redistribute it. When a
+container image built from this project is published, it redistributes the above
+components — retain their copyright/license notices.

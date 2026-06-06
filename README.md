@@ -29,3 +29,17 @@ It consists of a single Pod with two containers:
 5.  **Access Your Application:**
     * Check the pod status: `kubectl get pods -w`
     * Once running, access the application at the host you configured in the `Ingress` (e.g., `http://rtsp-detector.your-domain.com`).
+
+---
+
+## Upstream / Credits
+
+This is an original application that builds on the following open-source software and services; all credit to their
+authors. See [NOTICE](NOTICE).
+
+- Flask (BSD-3-Clause), Gunicorn (MIT), OpenCV (Apache-2.0), NumPy (BSD-3-Clause), Azure AI Vision SDKs (MIT)
+- The Azure AI Vision service is a proprietary Microsoft cloud service (bring your own key); it is not redistributed.
+
+## License
+
+Licensed under the **Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
